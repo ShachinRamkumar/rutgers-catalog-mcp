@@ -845,3 +845,98 @@ def test_transfer_metadata_migration_failure_does_not_block_fresh_cache_read(
         records, info = client.get_equivalencies()
     assert len(records) == 5
     assert info.source == "cache"
+
+
+def test_soc_unsolicited_304_and_retry_304_do_not_mark_stale_data_fresh(tmp_path: Path) -> None:
+    # Legacy split cache sends no If-None-Match; an unsolicited 304 must NOT refresh it.
+    (tmp_path / "courses-2026-9-NB.json").write_text('[{"courseString":"14:332:331"}]')
+    (tmp_path / "courses-2026-9-NB.meta.json").write_text(
+        '{"etag":"legacy-etag","max_age":-1,"fetched_at":"2026-08-01"}'
+    )
+    with httpx.Client(transport=httpx.MockTransport(lambda _: httpx.Response(304))) as http:
+        courses, info = SocClient(cache_dir=tmp_path, http_client=http).get_courses(
+            Term(2026, "fall"), "NB"
+        )
+    assert courses == [{"courseString": "14:332:331"}]
+    assert info.source == "stale_cache"
+    assert info.stale is True
+    assert not (tmp_path / "courses-2026-9-NB.cache.json").exists()
+
+    # On mismatch-and-retry, a second 304 is a protocol error that must reach the caller.
+    cache_file = tmp_path / "courses-2026-9-NB.cache.json"
+    cache_file.write_text(
+        json.dumps(
+            {
+                "meta": {"etag": '"v1"', "max_age": 60, "fetched_at": "2026-08-01"},
+                "payload": [{"courseString": "14:332:331"}],
+            }
+        )
+    )
+    os.utime(cache_file, (1, 1))
+    calls = 0
+
+    def mismatch_then_304(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(304, headers={"ETag": '"v2"'})
+        return httpx.Response(304)
+
+    with httpx.Client(transport=httpx.MockTransport(mismatch_then_304)) as http:
+        client = SocClient(cache_dir=tmp_path, http_client=http)
+        with pytest.raises(SocApiError, match="unconditional GET"):
+            client.get_courses(Term(2026, "fall"), "NB")
+    assert calls == 2
+
+
+def test_soc_mismatched_304_with_no_store_evicts_before_retry(tmp_path: Path) -> None:
+    cache_file = tmp_path / "courses-2026-9-NB.cache.json"
+    cache_file.write_text(
+        json.dumps(
+            {
+                "meta": {"etag": '"v1"', "max_age": 60, "fetched_at": "2026-08-01"},
+                "payload": [{"courseString": "14:332:331"}],
+            }
+        )
+    )
+    os.utime(cache_file, (1, 1))
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(304, headers={"ETag": '"v2"', "Cache-Control": "no-store"})
+        raise httpx.ConnectError("offline", request=request)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        client = SocClient(cache_dir=tmp_path, http_client=http)
+        with pytest.raises(SocApiError):
+            client.get_courses(Term(2026, "fall"), "NB")
+    assert not cache_file.exists()
+
+
+def test_transfer_read_only_cache_directory_still_serves_fresh_cache(tmp_path: Path) -> None:
+    cache_dir = tmp_path / "ro-cache"
+    cache_dir.mkdir()
+    (cache_dir / "middlesex-rutgers-soe-active.txt").write_text(SAMPLE_EXPORT, encoding="utf-8")
+    (cache_dir / "middlesex-rutgers-soe-active.meta.json").write_text(
+        json.dumps(
+            {
+                "fetched_at": "2026-10-03T00:00:00+00:00",
+                "url": "https://www.njtransfer.org/artweb/tempfiles/EN.MI.111222.listeq.txt",
+            }
+        )
+    )
+    if os.name != "nt":
+        cache_dir.chmod(0o555)
+    try:
+        with httpx.Client() as http:
+            records, info = NJTransferClient(
+                cache_dir=cache_dir, http_client=http
+            ).get_equivalencies()
+        assert len(records) == 5
+        assert info.source == "cache"
+    finally:
+        if os.name != "nt":
+            cache_dir.chmod(0o755)

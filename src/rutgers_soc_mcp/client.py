@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import html
 import json
 import os
@@ -68,6 +69,10 @@ _SUBJECT_COURSE_RE = re.compile(r"^(\d{1,3})\D+(\d{1,3})$")
 
 class SocApiError(RuntimeError):
     """Raised when Rutgers SOC data cannot be fetched or decoded."""
+
+
+class _SocProtocolError(SocApiError):
+    """Protocol violation that must reach the caller instead of returning stale cache."""
 
 
 @dataclass(frozen=True)
@@ -365,6 +370,19 @@ class SocClient:
         for suffix in (".json", ".meta.json"):
             (self.cache_dir / f"{stem}{suffix}").unlink(missing_ok=True)
 
+    @contextlib.contextmanager
+    def _cache_lock(self, stem: str):
+        lock = FileLock(str(self.cache_dir / f".{stem}.lock"))
+        try:
+            lock.acquire()
+        except OSError:
+            yield
+            return
+        try:
+            yield
+        finally:
+            lock.release()
+
     def _get_json(
         self,
         *,
@@ -374,9 +392,8 @@ class SocClient:
         fallback_max_age: int,
     ) -> tuple[Any, CacheInfo]:
         stem = f"{endpoint.removesuffix('.json')}-{term.year}-{term.code}-{campus}"
-        lock = FileLock(str(self.cache_dir / f".{stem}.lock"))
 
-        with lock:
+        with self._cache_lock(stem):
             cached_entry = self._read_cache(endpoint, stem)
             cached = cached_entry[0] if cached_entry is not None else None
             meta = cached_entry[1] if cached_entry is not None else {}
@@ -407,16 +424,26 @@ class SocClient:
             params = {"year": term.year, "term": term.code, "campus": campus}
             try:
                 response = self.http.get(url, params=params, headers=headers)
-                if response.status_code == 304 and cached is not None:
+                if response.status_code == 304:
+                    cache_control = response.headers.get("cache-control")
+                    if not (cached is not None and cached_etag):
+                        if _has_no_store(cache_control):
+                            self._evict_cache(stem)
+                            cached = None
+                        raise SocApiError("Rutgers SOC returned an unsolicited 304 response")
                     response_etag = response.headers.get("etag")
-                    if response_etag and cached_etag and response_etag != cached_etag:
-                        # RFC 9111 section 4.3.4: validator mismatch; refetch unconditionally.
+                    if response_etag and response_etag != cached_etag:
+                        # RFC 9111 section 4.3.4: validator mismatch; honor no-store before retry.
+                        if _has_no_store(cache_control):
+                            self._evict_cache(stem)
+                            cached = None
                         response = self.http.get(url, params=params)
                         if response.status_code == 304:
-                            raise SocApiError("Rutgers SOC returned 304 to an unconditional GET")
+                            raise _SocProtocolError(
+                                "Rutgers SOC returned 304 to an unconditional GET"
+                            )
                     else:
                         now = datetime.now(tz=UTC)
-                        cache_control = response.headers.get("cache-control")
                         if _has_no_store(cache_control):
                             self._evict_cache(stem)
                         else:
@@ -437,6 +464,8 @@ class SocClient:
                     cached = None
                 payload = response.json()
                 self._validate_payload(endpoint, payload)
+            except _SocProtocolError:
+                raise
             except (httpx.HTTPError, ValueError, SocApiError) as exc:
                 if cached is not None and cache_source_path is not None:
                     return cached, CacheInfo(

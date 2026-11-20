@@ -306,12 +306,24 @@ class NJTransferClient:
         if self._owns_http_client:
             self.http.close()
 
+    @contextlib.contextmanager
+    def _cache_lock(self):
+        lock = FileLock(str(self.cache_dir / ".middlesex-rutgers-soe-active.lock"))
+        try:
+            lock.acquire()
+        except OSError:
+            yield
+            return
+        try:
+            yield
+        finally:
+            lock.release()
+
     def get_equivalencies(self) -> tuple[list[Equivalency], CacheInfo]:
         data_path = self.cache_dir / "middlesex-rutgers-soe-active.txt"
         meta_path = self.cache_dir / "middlesex-rutgers-soe-active.meta.json"
-        lock = FileLock(str(self.cache_dir / ".middlesex-rutgers-soe-active.lock"))
 
-        with lock:
+        with self._cache_lock():
             meta = self._read_meta(meta_path)
             if meta.get("url") and meta["url"] != NJ_TRANSFER_LOOKUP:
                 meta = {**meta, "url": NJ_TRANSFER_LOOKUP}
