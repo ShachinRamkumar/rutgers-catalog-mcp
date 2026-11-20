@@ -318,23 +318,52 @@ class SocClient:
         if not valid:
             raise SocApiError(f"Rutgers SOC returned an unexpected {endpoint} payload")
 
-    def _read_bundle(self, endpoint: str, bundle_path: Path) -> tuple[Any, dict[str, Any]] | None:
-        if not bundle_path.exists():
+    def _read_cache(self, endpoint: str, stem: str) -> tuple[Any, dict[str, Any], Path] | None:
+        bundle_path = self.cache_dir / f"{stem}.cache.json"
+        if bundle_path.exists():
+            try:
+                raw = self._read_json(bundle_path)
+                if not isinstance(raw, dict) or "payload" not in raw:
+                    return None
+                payload = raw["payload"]
+                meta = raw.get("meta")
+                self._validate_payload(endpoint, payload)
+                return payload, meta if isinstance(meta, dict) else {}, bundle_path
+            except SocApiError:
+                return None
+
+        legacy_data = self.cache_dir / f"{stem}.json"
+        if not legacy_data.exists():
             return None
         try:
-            raw = self._read_json(bundle_path)
-            if not isinstance(raw, dict) or "payload" not in raw:
-                return None
-            payload = raw["payload"]
-            meta = raw.get("meta")
+            payload = self._read_json(legacy_data)
             self._validate_payload(endpoint, payload)
-            return payload, meta if isinstance(meta, dict) else {}
         except SocApiError:
             return None
+        legacy_meta_path = self.cache_dir / f"{stem}.meta.json"
+        legacy_meta: dict[str, Any] = {}
+        if legacy_meta_path.exists():
+            try:
+                parsed = json.loads(legacy_meta_path.read_bytes())
+                if isinstance(parsed, dict):
+                    legacy_meta = {
+                        k: v for k, v in parsed.items() if k in {"fetched_at", "max_age", "url"}
+                    }
+            except (OSError, json.JSONDecodeError, UnicodeError):
+                legacy_meta = {}
+        # Never trust a legacy separately-written ETag; keep payload for fresh/offline continuity.
+        return payload, legacy_meta, legacy_data
 
-    def _write_bundle(self, bundle_path: Path, payload: Any, meta: dict[str, Any]) -> None:
+    def _evict_cache(self, stem: str) -> None:
+        for suffix in (".cache.json", ".json", ".meta.json"):
+            (self.cache_dir / f"{stem}{suffix}").unlink(missing_ok=True)
+
+    def _write_bundle(self, stem: str, payload: Any, meta: dict[str, Any]) -> None:
+        bundle_path = self.cache_dir / f"{stem}.cache.json"
         serialized = json.dumps({"meta": meta, "payload": payload}, separators=(",", ":")).encode()
         self._atomic_write(bundle_path, serialized)
+        for suffix in (".json", ".meta.json"):
+            (self.cache_dir / f"{stem}{suffix}").unlink(missing_ok=True)
 
     def _get_json(
         self,
@@ -345,17 +374,17 @@ class SocClient:
         fallback_max_age: int,
     ) -> tuple[Any, CacheInfo]:
         stem = f"{endpoint.removesuffix('.json')}-{term.year}-{term.code}-{campus}"
-        bundle_path = self.cache_dir / f"{stem}.cache.json"
         lock = FileLock(str(self.cache_dir / f".{stem}.lock"))
 
         with lock:
-            cached_bundle = self._read_bundle(endpoint, bundle_path)
-            cached = cached_bundle[0] if cached_bundle is not None else None
-            meta = cached_bundle[1] if cached_bundle is not None else {}
+            cached_entry = self._read_cache(endpoint, stem)
+            cached = cached_entry[0] if cached_entry is not None else None
+            meta = cached_entry[1] if cached_entry is not None else {}
+            cache_source_path = cached_entry[2] if cached_entry is not None else None
 
             max_age = fallback_max_age
-            if cached is not None:
-                age = datetime.now(tz=UTC).timestamp() - bundle_path.stat().st_mtime
+            if cached is not None and cache_source_path is not None:
+                age = datetime.now(tz=UTC).timestamp() - cache_source_path.stat().st_mtime
                 try:
                     max_age = int(meta.get("max_age", fallback_max_age))
                 except (TypeError, ValueError):
@@ -364,61 +393,70 @@ class SocClient:
                     return cached, CacheInfo(
                         source="cache",
                         fetched_at=meta.get(
-                            "fetched_at", _iso_timestamp(bundle_path.stat().st_mtime)
+                            "fetched_at", _iso_timestamp(cache_source_path.stat().st_mtime)
                         ),
                         stale=False,
                     )
 
             headers: dict[str, str] = {}
-            if cached is not None and meta.get("etag"):
-                headers["If-None-Match"] = str(meta["etag"])
+            cached_etag = str(meta["etag"]) if cached is not None and meta.get("etag") else None
+            if cached_etag:
+                headers["If-None-Match"] = cached_etag
 
             url = f"{SOC_API_BASE}/{endpoint}"
             params = {"year": term.year, "term": term.code, "campus": campus}
             try:
                 response = self.http.get(url, params=params, headers=headers)
                 if response.status_code == 304 and cached is not None:
-                    now = datetime.now(tz=UTC)
-                    cache_control = response.headers.get("cache-control")
-                    if _has_no_store(cache_control):
-                        bundle_path.unlink(missing_ok=True)
+                    response_etag = response.headers.get("etag")
+                    if response_etag and cached_etag and response_etag != cached_etag:
+                        # RFC 9111 section 4.3.4: validator mismatch; refetch unconditionally.
+                        response = self.http.get(url, params=params)
+                        if response.status_code == 304:
+                            raise SocApiError("Rutgers SOC returned 304 to an unconditional GET")
                     else:
-                        updated_meta = {
-                            **meta,
-                            "etag": response.headers.get("etag") or meta.get("etag"),
-                            "fetched_at": now.isoformat(),
-                            "max_age": _parse_max_age(cache_control, max_age),
-                        }
-                        self._write_bundle(bundle_path, cached, updated_meta)
-                    return cached, CacheInfo(
-                        source="validated_cache", fetched_at=now.isoformat(), stale=False
-                    )
+                        now = datetime.now(tz=UTC)
+                        cache_control = response.headers.get("cache-control")
+                        if _has_no_store(cache_control):
+                            self._evict_cache(stem)
+                        else:
+                            updated_meta = {
+                                **meta,
+                                "etag": cached_etag,
+                                "fetched_at": now.isoformat(),
+                                "max_age": _parse_max_age(cache_control, max_age),
+                            }
+                            self._write_bundle(stem, cached, updated_meta)
+                        return cached, CacheInfo(
+                            source="validated_cache", fetched_at=now.isoformat(), stale=False
+                        )
                 response.raise_for_status()
+                cache_control = response.headers.get("cache-control")
+                if _has_no_store(cache_control):
+                    self._evict_cache(stem)
+                    cached = None
                 payload = response.json()
                 self._validate_payload(endpoint, payload)
             except (httpx.HTTPError, ValueError, SocApiError) as exc:
-                if cached is not None:
+                if cached is not None and cache_source_path is not None:
                     return cached, CacheInfo(
                         source="stale_cache",
                         fetched_at=meta.get(
-                            "fetched_at", _iso_timestamp(bundle_path.stat().st_mtime)
+                            "fetched_at", _iso_timestamp(cache_source_path.stat().st_mtime)
                         ),
                         stale=True,
                     )
                 raise SocApiError(f"Could not fetch Rutgers SOC data: {exc}") from exc
 
             now = datetime.now(tz=UTC)
-            cache_control = response.headers.get("cache-control")
-            if _has_no_store(cache_control):
-                bundle_path.unlink(missing_ok=True)
-            else:
+            if not _has_no_store(cache_control):
                 new_meta = {
                     "etag": response.headers.get("etag"),
                     "fetched_at": now.isoformat(),
                     "max_age": _parse_max_age(cache_control, fallback_max_age),
                     "url": str(response.url),
                 }
-                self._write_bundle(bundle_path, payload, new_meta)
+                self._write_bundle(stem, payload, new_meta)
             return payload, CacheInfo(source="network", fetched_at=now.isoformat(), stale=False)
 
     @staticmethod

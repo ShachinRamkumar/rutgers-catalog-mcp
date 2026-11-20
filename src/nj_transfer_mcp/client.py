@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import csv
 import html
 import io
@@ -314,7 +315,8 @@ class NJTransferClient:
             meta = self._read_meta(meta_path)
             if meta.get("url") and meta["url"] != NJ_TRANSFER_LOOKUP:
                 meta = {**meta, "url": NJ_TRANSFER_LOOKUP}
-                self._atomic_write(meta_path, json.dumps(meta).encode())
+                with contextlib.suppress(OSError):
+                    self._atomic_write(meta_path, json.dumps(meta).encode())
             cached_records: list[Equivalency] | None = None
             if data_path.exists():
                 try:

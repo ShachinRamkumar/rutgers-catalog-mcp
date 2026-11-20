@@ -732,3 +732,116 @@ def test_verify_package_rejects_nested_private_client_configs(
 
     with pytest.raises(ValueError, match="Private state or client config"):
         check_archives(clean_wheel, bad_sdist)
+
+
+def test_soc_mismatched_304_etag_refetches_unconditionally(tmp_path: Path) -> None:
+    cache_file = tmp_path / "courses-2026-9-NB.cache.json"
+    cache_file.write_text(
+        json.dumps(
+            {
+                "meta": {"etag": '"v1"', "max_age": 60, "fetched_at": "2026-08-01"},
+                "payload": [{"courseString": "14:332:331"}],
+            }
+        )
+    )
+    os.utime(cache_file, (1, 1))
+    requests: list[dict[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(dict(request.headers))
+        if len(requests) == 1:
+            return httpx.Response(304, headers={"ETag": '"v2"'})
+        assert "if-none-match" not in {k.lower() for k in request.headers}
+        return httpx.Response(
+            200,
+            json=[{"courseString": "14:332:452"}],
+            headers={"ETag": '"v2"', "Cache-Control": "max-age=900"},
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        courses, info = SocClient(cache_dir=tmp_path, http_client=http).get_courses(
+            Term(2026, "fall"), "NB"
+        )
+    assert len(requests) == 2
+    assert courses == [{"courseString": "14:332:452"}]
+    assert info.source == "network"
+    stored = json.loads(cache_file.read_text())
+    assert stored["meta"]["etag"] == '"v2"'
+    assert stored["payload"] == [{"courseString": "14:332:452"}]
+
+
+def test_soc_legacy_split_cache_falls_back_offline_without_trusting_old_etag(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "courses-2026-9-NB.json").write_text('[{"courseString":"14:332:331"}]')
+    (tmp_path / "courses-2026-9-NB.meta.json").write_text(
+        '{"etag":"legacy-etag","max_age":-1,"fetched_at":"2026-08-01"}'
+    )
+    seen_headers: list[dict[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_headers.append(dict(request.headers))
+        raise httpx.ConnectError("offline", request=request)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        courses, info = SocClient(cache_dir=tmp_path, http_client=http).get_courses(
+            Term(2026, "fall"), "NB"
+        )
+    assert courses == [{"courseString": "14:332:331"}]
+    assert info.source == "stale_cache"
+    assert info.stale is True
+    assert "if-none-match" not in {k.lower() for k in seen_headers[0]}
+
+
+def test_soc_malformed_200_no_store_evicts_previous_bundle(tmp_path: Path) -> None:
+    cache_file = tmp_path / "courses-2026-9-NB.cache.json"
+    cache_file.write_text(
+        json.dumps(
+            {
+                "meta": {"etag": '"v1"', "max_age": 60, "fetched_at": "2026-08-01"},
+                "payload": [{"courseString": "14:332:331"}],
+            }
+        )
+    )
+    os.utime(cache_file, (1, 1))
+
+    with httpx.Client(
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(
+                200,
+                json={"error": "malformed"},
+                headers={"Cache-Control": "no-store"},
+            )
+        )
+    ) as http:
+        client = SocClient(cache_dir=tmp_path, http_client=http)
+        with pytest.raises(SocApiError):
+            client.get_courses(Term(2026, "fall"), "NB")
+    assert not cache_file.exists()
+
+
+def test_transfer_metadata_migration_failure_does_not_block_fresh_cache_read(
+    tmp_path: Path, monkeypatch
+) -> None:
+    data_path = tmp_path / "middlesex-rutgers-soe-active.txt"
+    meta_path = tmp_path / "middlesex-rutgers-soe-active.meta.json"
+    data_path.write_text(SAMPLE_EXPORT, encoding="utf-8")
+    meta_path.write_text(
+        json.dumps(
+            {
+                "fetched_at": "2026-10-03T00:00:00+00:00",
+                "url": "https://www.njtransfer.org/artweb/tempfiles/EN.MI.333222.listeq.txt",
+            }
+        )
+    )
+
+    with httpx.Client() as http:
+        client = NJTransferClient(cache_dir=tmp_path, http_client=http)
+        monkeypatch.setattr(
+            client,
+            "_atomic_write",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk full")),
+        )
+        records, info = client.get_equivalencies()
+    assert len(records) == 5
+    assert info.source == "cache"
