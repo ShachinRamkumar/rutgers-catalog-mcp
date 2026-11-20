@@ -49,7 +49,7 @@ flowchart LR
   - Queried live on every call (not cached on disk) using a public guest session token with automatic session refresh on `400`/`403`. Every tool returns a `retrieved_at` Eastern-time timestamp.
   - Translates caller-requested `(page, limit)` slices cleanly across upstream 30-item pages (avoiding client-side skips or duplicates over stable result sets; live catalog inventory can still change between separate requests).
 - **NJ Transfer (`njtransfer.org/artweb/precs.cgi`)**
-  - Caches the active-course equivalency export atomically on disk for 24 hours (self-healing if corrupt, with stale fallback on network failure) and caches per-evaluation detail lookups (minimum grade, footnote text, linked-course requirements) in memory for 15 minutes while reusing the active session and capping detail fetches per call. Refreshing the export invalidates the in-memory detail cache.
+  - Caches the active-course equivalency export atomically on disk for 24 hours (self-healing if corrupt, with stale fallback on network failure) and caches per-evaluation detail lookups (minimum grade, footnote text, linked-course requirements) in memory for 15 minutes while reusing the active session and capping detail fetches at 10 per call (reporting `details_truncated: true` if capped). Refreshing the export invalidates the in-memory detail cache.
   - `include_history=true` returns superseded historical evaluations for active Middlesex courses present in the active export; inactive/retired courses are not included.
 
 Cache directories default to the platform user cache location (`platformdirs`) and can be overridden with `RUTGERS_SOC_CACHE_DIR` and `NJ_TRANSFER_CACHE_DIR`.

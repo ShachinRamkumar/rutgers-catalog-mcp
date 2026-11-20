@@ -140,8 +140,15 @@ def get_middlesex_course_equivalency(
         raise ToolError("middlesex_course_code must look like MAT132, MAT-132, or CSC 235")
 
     current, all_records, cache_info = _records()
-    source = all_records if include_history else current
-    matches = [item for item in source if item.middlesex_course == normalized]
+    if include_history:
+        active_courses = {item.middlesex_course for item in current}
+        matches = (
+            [item for item in all_records if item.middlesex_course == normalized]
+            if normalized in active_courses
+            else []
+        )
+    else:
+        matches = [item for item in current if item.middlesex_course == normalized]
     matches.sort(key=lambda item: item.evaluation_key, reverse=True)
     result = _envelope(matches, cache_info, expand_details=True)
     result["middlesex_course_code"] = normalized

@@ -80,10 +80,11 @@ def test_client_fetches_then_uses_fresh_cache(tmp_path: Path) -> None:
 
 
 def test_client_falls_back_to_stale_cache(tmp_path: Path) -> None:
-    data_path = tmp_path / "courses-2026-9-NB.json"
-    meta_path = tmp_path / "courses-2026-9-NB.meta.json"
-    data_path.write_text('[{"courseString":"14:332:331"}]')
-    meta_path.write_text('{"max_age":-1,"fetched_at":"2026-01-01T00:00:00+00:00"}')
+    bundle_path = tmp_path / "courses-2026-9-NB.cache.json"
+    bundle_path.write_text(
+        '{"meta":{"max_age":-1,"fetched_at":"2026-01-01T00:00:00+00:00"},'
+        '"payload":[{"courseString":"14:332:331"}]}'
+    )
 
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("offline", request=request)

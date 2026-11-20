@@ -23,7 +23,11 @@ _DAY_NAMES = {
 def _person_names(instructors: Any) -> list[str]:
     if not isinstance(instructors, list):
         return []
-    return [clean_text(item.get("name")) for item in instructors if clean_text(item.get("name"))]
+    return [
+        clean_text(item.get("name"))
+        for item in instructors
+        if isinstance(item, dict) and clean_text(item.get("name"))
+    ]
 
 
 def _location_names(locations: Any) -> list[str]:
@@ -32,7 +36,7 @@ def _location_names(locations: Any) -> list[str]:
     return [
         clean_text(item.get("description"))
         for item in locations
-        if clean_text(item.get("description"))
+        if isinstance(item, dict) and clean_text(item.get("description"))
     ]
 
 

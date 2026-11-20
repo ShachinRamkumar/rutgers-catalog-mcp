@@ -102,16 +102,25 @@ def test_bad_upstream_payload_preserves_valid_cache(tmp_path: Path, endpoint: st
         client = SocClient(cache_dir=tmp_path, http_client=http)
         fetch = client.get_courses if endpoint == "courses" else client.get_open_sections
         original, _ = fetch(Term(2026, "fall"), "NB")
-        path = tmp_path / f"{endpoint}-2026-9-NB.json"
+        path = tmp_path / f"{endpoint}-2026-9-NB.cache.json"
         os.utime(path, (1, 1))
         for _ in range(2):
             result, info = fetch(Term(2026, "fall"), "NB")
             assert result == original
             assert info.stale is True
-            assert json.loads(path.read_text()) == good
+            assert json.loads(path.read_text())["payload"] == good
 
 
-@pytest.mark.parametrize("bad", [{"error": "failure"}, [None], [{"bad": "record"}]])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"error": "failure"},
+        [None],
+        [{"bad": "record"}],
+        [{"courseString": "14:332:331", "sections": None}],
+        [{"courseString": "14:332:331", "sections": [{"instructors": [None]}]}],
+    ],
+)
 def test_invalid_courses_are_not_cached(tmp_path: Path, bad) -> None:
     with httpx.Client(
         transport=httpx.MockTransport(lambda _: httpx.Response(200, json=bad))
@@ -119,12 +128,12 @@ def test_invalid_courses_are_not_cached(tmp_path: Path, bad) -> None:
         client = SocClient(cache_dir=tmp_path, http_client=http)
         with pytest.raises(SocApiError):
             client.get_courses(Term(2026, "fall"), "NB")
-    assert not (tmp_path / "courses-2026-9-NB.json").exists()
+    assert not (tmp_path / "courses-2026-9-NB.cache.json").exists()
 
 
 @pytest.mark.parametrize("content", [b"broken JSON", b'{"error":"old bad response"}', b"\xff"])
 def test_corrupted_cache_is_replaced_from_network(tmp_path: Path, content: bytes) -> None:
-    path = tmp_path / "courses-2026-9-NB.json"
+    path = tmp_path / "courses-2026-9-NB.cache.json"
     path.write_bytes(content)
     with httpx.Client(
         transport=httpx.MockTransport(
@@ -228,12 +237,16 @@ def test_transfer_details_expire_and_preserve_provenance(tmp_path: Path, monkeyp
 
 
 def test_rutgers_revalidation_uses_etag_and_retains_cache_hint(tmp_path: Path) -> None:
-    path = tmp_path / "courses-2026-9-NB.json"
-    path.write_text('[{"courseString":"14:332:331"}]')
-    os.utime(path, (1, 1))
-    (tmp_path / "courses-2026-9-NB.meta.json").write_text(
-        '{"etag":"test-etag","max_age":1200,"fetched_at":"2026-08-01"}'
+    path = tmp_path / "courses-2026-9-NB.cache.json"
+    path.write_text(
+        json.dumps(
+            {
+                "meta": {"etag": "test-etag", "max_age": 1200, "fetched_at": "2026-08-01"},
+                "payload": [{"courseString": "14:332:331"}],
+            }
+        )
     )
+    os.utime(path, (1, 1))
 
     def handler(request):
         assert request.headers["If-None-Match"] == "test-etag"
@@ -246,7 +259,7 @@ def test_rutgers_revalidation_uses_etag_and_retains_cache_hint(tmp_path: Path) -
     assert result[0]["courseString"] == "14:332:331"
     assert info.source == "validated_cache"
     assert info.stale is False
-    assert json.loads((tmp_path / "courses-2026-9-NB.meta.json").read_text())["max_age"] == 1800
+    assert json.loads(path.read_text())["meta"]["max_age"] == 1800
 
 
 @pytest.mark.anyio
@@ -498,16 +511,35 @@ def test_transfer_error_sanitization_redacts_session_ids() -> None:
     assert "<redacted>" in sanitized
 
 
-def test_soc_rejects_null_sections_and_honors_no_store(tmp_path: Path) -> None:
-    with httpx.Client(
-        transport=httpx.MockTransport(
-            lambda _: httpx.Response(200, json=[{"courseString": "14:332:331", "sections": None}])
+def test_soc_honors_no_store_and_invalidates_on_304(tmp_path: Path) -> None:
+    cache_file = tmp_path / "courses-2026-9-NB.cache.json"
+    cache_file.write_text(
+        json.dumps(
+            {
+                "meta": {"etag": "etag-v1", "max_age": 60, "fetched_at": "2026-08-01"},
+                "payload": [{"courseString": "14:332:331", "sections": []}],
+            }
         )
-    ) as http:
+    )
+    os.utime(cache_file, (1, 1))
+
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(304, headers={"Cache-Control": "no-store"})
+        raise httpx.ConnectError("offline", request=request)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
         client = SocClient(cache_dir=tmp_path, http_client=http)
+        courses, info = client.get_courses(Term(2026, "fall"), "NB")
+        assert courses[0]["courseString"] == "14:332:331"
+        assert info.source == "validated_cache"
+        assert not cache_file.exists()
         with pytest.raises(SocApiError):
             client.get_courses(Term(2026, "fall"), "NB")
-    assert not (tmp_path / "courses-2026-9-NB.json").exists()
 
     with httpx.Client(
         transport=httpx.MockTransport(
@@ -523,7 +555,122 @@ def test_soc_rejects_null_sections_and_honors_no_store(tmp_path: Path) -> None:
         )
     assert courses[0]["courseString"] == "14:332:331"
     assert info.source == "network"
-    assert not (tmp_path / "courses-2026-9-NB.json").exists()
+    assert not cache_file.exists()
+
+
+def test_soc_atomic_bundle_preserves_matching_etag_on_write_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    cache_file = tmp_path / "courses-2026-9-NB.cache.json"
+    cache_file.write_text(
+        json.dumps(
+            {
+                "meta": {"etag": "etag-v1", "max_age": 60, "fetched_at": "2026-08-01"},
+                "payload": [{"courseString": "14:332:331"}],
+            }
+        )
+    )
+    os.utime(cache_file, (1, 1))
+
+    with httpx.Client(
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(
+                200,
+                json=[{"courseString": "14:332:452"}],
+                headers={"ETag": "etag-v2", "Cache-Control": "max-age=900"},
+            )
+        )
+    ) as http:
+        client = SocClient(cache_dir=tmp_path, http_client=http)
+        monkeypatch.setattr(
+            client,
+            "_atomic_write",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk full")),
+        )
+        with pytest.raises(OSError, match="disk full"):
+            client.get_courses(Term(2026, "fall"), "NB")
+
+    stored = json.loads(cache_file.read_text())
+    assert stored["meta"]["etag"] == "etag-v1"
+    assert stored["payload"] == [{"courseString": "14:332:331"}]
+
+
+def test_transfer_detail_failure_redacts_exception_traceback(tmp_path: Path, monkeypatch) -> None:
+    import traceback
+
+    record = current_equivalencies(parse_export(SAMPLE_EXPORT))[-1]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, request=request)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        client = NJTransferClient(cache_dir=tmp_path, http_client=http)
+        monkeypatch.setattr(client, "_start_session", lambda: "555444333")
+        with pytest.raises(transfer_client.NJTransferError) as exc_info:
+            client.get_equivalency_details(record)
+
+    formatted = "".join(traceback.format_exception(exc_info.value))
+    assert "555444333" not in formatted
+    assert exc_info.value.__cause__ is None
+
+
+def test_transfer_migrates_legacy_metadata_and_recovers_from_corrupt_meta_and_csv(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import csv
+
+    data_path = tmp_path / "middlesex-rutgers-soe-active.txt"
+    meta_path = tmp_path / "middlesex-rutgers-soe-active.meta.json"
+    data_path.write_text(SAMPLE_EXPORT, encoding="utf-8")
+    meta_path.write_text(
+        json.dumps(
+            {
+                "fetched_at": "2026-10-03T00:00:00+00:00",
+                "url": "https://www.njtransfer.org/artweb/tempfiles/EN.MI.444555.listeq.txt",
+            }
+        )
+    )
+
+    with httpx.Client() as http:
+        client = NJTransferClient(cache_dir=tmp_path, http_client=http)
+        records, info = client.get_equivalencies()
+    assert len(records) == 5
+    assert info.source == "cache"
+    migrated = json.loads(meta_path.read_text())
+    assert "444555" not in migrated["url"]
+    assert migrated["url"] == transfer_client.NJ_TRANSFER_LOOKUP
+
+    # Invalid UTF-8 metadata + oversized CSV field in cache both self-heal from network.
+    meta_path.write_bytes(b"\xff\xfe\xfd")
+    oversized = "A" * (csv.field_size_limit() + 10)
+    data_path.write_text(f"SI~Course~RI~Receiver Term~Equivalency~Transferable\n{oversized}\n")
+    with httpx.Client() as http:
+        client = NJTransferClient(cache_dir=tmp_path, http_client=http)
+        monkeypatch.setattr(
+            client, "_download_export", lambda: (SAMPLE_EXPORT, transfer_client.NJ_TRANSFER_LOOKUP)
+        )
+        healed, healed_info = client.get_equivalencies()
+    assert len(healed) == 5
+    assert healed_info.source == "network"
+
+
+@pytest.mark.anyio
+async def test_transfer_history_excludes_inactive_courses(monkeypatch) -> None:
+    from nj_transfer_mcp import server as transfer_server
+    from nj_transfer_mcp.client import CacheInfo as TransferCacheInfo
+
+    class FakeClient:
+        def get_equivalencies(self):
+            return parse_export(SAMPLE_EXPORT), TransferCacheInfo("cache", "2026-10-03", False)
+
+    monkeypatch.setattr(transfer_server, "_client", FakeClient())
+    async with Client(transfer_server.mcp) as client:
+        result = await client.call_tool(
+            "NJTransfer_Middlesex_Course",
+            {"middlesex_course_code": "OLD100", "include_history": True},
+        )
+    assert not result.is_error
+    assert result.structured_content["match_count"] == 0
 
 
 @pytest.mark.anyio
@@ -538,7 +685,18 @@ async def test_middlesex_search_options_includes_retrieval_timestamp(monkeypatch
     assert result.structured_content["retrieved_at"]
 
 
-def test_verify_package_rejects_nested_private_client_configs(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "bad_entry",
+    [
+        "rutgers_soc_mcp/.claude.json",
+        "rutgers_soc_mcp/.CLAUDE.JSON",
+        "rutgers_soc_mcp/1-.claude.json",
+        "rutgers_soc_mcp/0-config.toml",
+    ],
+)
+def test_verify_package_rejects_nested_private_client_configs(
+    tmp_path: Path, bad_entry: str
+) -> None:
     import io
     import runpy
     import tarfile
@@ -556,14 +714,14 @@ def test_verify_package_rejects_nested_private_client_configs(tmp_path: Path) ->
 
     bad_wheel = tmp_path / "bad.whl"
     with zipfile.ZipFile(bad_wheel, "w") as zf:
-        zf.writestr("rutgers_soc_mcp/.claude.json", "{}")
+        zf.writestr(bad_entry, "{}")
 
     with pytest.raises(ValueError, match="Private state or client config"):
         check_archives(bad_wheel, clean_sdist)
 
     bad_sdist = tmp_path / "bad.tar.gz"
     with tarfile.open(bad_sdist, "w:gz") as tar:
-        info = tarfile.TarInfo("pkg-0.1.0/src/.codex/config.toml")
+        info = tarfile.TarInfo(f"pkg-0.1.0/src/{bad_entry}")
         data = b"model = 'x'"
         info.size = len(data)
         tar.addfile(info, io.BytesIO(data))

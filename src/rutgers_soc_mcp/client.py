@@ -272,14 +272,41 @@ class SocClient:
         return {str(index) for index in data}, info
 
     @staticmethod
-    def _validate_payload(endpoint: str, payload: Any) -> None:
+    def _valid_dict_list(value: Any) -> bool:
+        return value is None or (
+            isinstance(value, list) and all(isinstance(entry, dict) for entry in value)
+        )
+
+    @classmethod
+    def _valid_section(cls, section: Any) -> bool:
+        return (
+            isinstance(section, dict)
+            and cls._valid_dict_list(section.get("instructors"))
+            and cls._valid_dict_list(section.get("meetingTimes"))
+            and cls._valid_dict_list(section.get("sectionCampusLocations"))
+        )
+
+    @classmethod
+    def _validate_payload(cls, endpoint: str, payload: Any) -> None:
         valid = isinstance(payload, list)
         if valid and endpoint == "courses.json":
             valid = all(
                 isinstance(item, dict)
                 and isinstance(item.get("courseString"), str)
                 and bool(item["courseString"])
-                and ("sections" not in item or isinstance(item["sections"], list))
+                and cls._valid_dict_list(item.get("campusLocations"))
+                and (
+                    "coreCodes" not in item
+                    or item["coreCodes"] is None
+                    or isinstance(item["coreCodes"], list)
+                )
+                and (
+                    "sections" not in item
+                    or (
+                        isinstance(item["sections"], list)
+                        and all(cls._valid_section(sec) for sec in item["sections"])
+                    )
+                )
                 for item in payload
             )
         elif valid:
@@ -291,6 +318,24 @@ class SocClient:
         if not valid:
             raise SocApiError(f"Rutgers SOC returned an unexpected {endpoint} payload")
 
+    def _read_bundle(self, endpoint: str, bundle_path: Path) -> tuple[Any, dict[str, Any]] | None:
+        if not bundle_path.exists():
+            return None
+        try:
+            raw = self._read_json(bundle_path)
+            if not isinstance(raw, dict) or "payload" not in raw:
+                return None
+            payload = raw["payload"]
+            meta = raw.get("meta")
+            self._validate_payload(endpoint, payload)
+            return payload, meta if isinstance(meta, dict) else {}
+        except SocApiError:
+            return None
+
+    def _write_bundle(self, bundle_path: Path, payload: Any, meta: dict[str, Any]) -> None:
+        serialized = json.dumps({"meta": meta, "payload": payload}, separators=(",", ":")).encode()
+        self._atomic_write(bundle_path, serialized)
+
     def _get_json(
         self,
         *,
@@ -300,23 +345,17 @@ class SocClient:
         fallback_max_age: int,
     ) -> tuple[Any, CacheInfo]:
         stem = f"{endpoint.removesuffix('.json')}-{term.year}-{term.code}-{campus}"
-        data_path = self.cache_dir / f"{stem}.json"
-        meta_path = self.cache_dir / f"{stem}.meta.json"
+        bundle_path = self.cache_dir / f"{stem}.cache.json"
         lock = FileLock(str(self.cache_dir / f".{stem}.lock"))
 
         with lock:
-            meta = self._read_meta(meta_path)
-            cached = None
-            if data_path.exists():
-                try:
-                    cached = self._read_json(data_path)
-                    self._validate_payload(endpoint, cached)
-                except SocApiError:
-                    cached = None
+            cached_bundle = self._read_bundle(endpoint, bundle_path)
+            cached = cached_bundle[0] if cached_bundle is not None else None
+            meta = cached_bundle[1] if cached_bundle is not None else {}
 
             max_age = fallback_max_age
             if cached is not None:
-                age = datetime.now(tz=UTC).timestamp() - data_path.stat().st_mtime
+                age = datetime.now(tz=UTC).timestamp() - bundle_path.stat().st_mtime
                 try:
                     max_age = int(meta.get("max_age", fallback_max_age))
                 except (TypeError, ValueError):
@@ -325,7 +364,7 @@ class SocClient:
                     return cached, CacheInfo(
                         source="cache",
                         fetched_at=meta.get(
-                            "fetched_at", _iso_timestamp(data_path.stat().st_mtime)
+                            "fetched_at", _iso_timestamp(bundle_path.stat().st_mtime)
                         ),
                         stale=False,
                     )
@@ -341,14 +380,16 @@ class SocClient:
                 if response.status_code == 304 and cached is not None:
                     now = datetime.now(tz=UTC)
                     cache_control = response.headers.get("cache-control")
-                    if not _has_no_store(cache_control):
-                        os.utime(data_path, (now.timestamp(), now.timestamp()))
+                    if _has_no_store(cache_control):
+                        bundle_path.unlink(missing_ok=True)
+                    else:
                         updated_meta = {
                             **meta,
+                            "etag": response.headers.get("etag") or meta.get("etag"),
                             "fetched_at": now.isoformat(),
                             "max_age": _parse_max_age(cache_control, max_age),
                         }
-                        self._atomic_write(meta_path, json.dumps(updated_meta).encode())
+                        self._write_bundle(bundle_path, cached, updated_meta)
                     return cached, CacheInfo(
                         source="validated_cache", fetched_at=now.isoformat(), stale=False
                     )
@@ -360,7 +401,7 @@ class SocClient:
                     return cached, CacheInfo(
                         source="stale_cache",
                         fetched_at=meta.get(
-                            "fetched_at", _iso_timestamp(data_path.stat().st_mtime)
+                            "fetched_at", _iso_timestamp(bundle_path.stat().st_mtime)
                         ),
                         stale=True,
                     )
@@ -368,16 +409,16 @@ class SocClient:
 
             now = datetime.now(tz=UTC)
             cache_control = response.headers.get("cache-control")
-            if not _has_no_store(cache_control):
-                serialized = json.dumps(payload, separators=(",", ":")).encode()
+            if _has_no_store(cache_control):
+                bundle_path.unlink(missing_ok=True)
+            else:
                 new_meta = {
                     "etag": response.headers.get("etag"),
                     "fetched_at": now.isoformat(),
                     "max_age": _parse_max_age(cache_control, fallback_max_age),
                     "url": str(response.url),
                 }
-                self._atomic_write(data_path, serialized)
-                self._atomic_write(meta_path, json.dumps(new_meta).encode())
+                self._write_bundle(bundle_path, payload, new_meta)
             return payload, CacheInfo(source="network", fetched_at=now.isoformat(), stale=False)
 
     @staticmethod
@@ -386,16 +427,6 @@ class SocClient:
             return json.loads(path.read_bytes())
         except (OSError, json.JSONDecodeError, UnicodeError) as exc:
             raise SocApiError(f"Could not read cached SOC data at {path}: {exc}") from exc
-
-    @staticmethod
-    def _read_meta(path: Path) -> dict[str, Any]:
-        if not path.exists():
-            return {}
-        try:
-            value = json.loads(path.read_bytes())
-            return value if isinstance(value, dict) else {}
-        except (OSError, json.JSONDecodeError, UnicodeError):
-            return {}
 
     @staticmethod
     def _atomic_write(path: Path, content: bytes) -> None:

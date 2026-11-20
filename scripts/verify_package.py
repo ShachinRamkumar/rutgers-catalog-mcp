@@ -55,10 +55,22 @@ def check_archives(wheel: Path, source: Path) -> None:
     def check_private_path(name: str) -> None:
         parts = Path(name).parts
         for part in parts:
+            lower = part.lower()
             if (
-                part in {".git", ".codex", ".claude", ".claude.json", ".mcp.json", ".env"}
-                or (part.startswith(".env.") and part != ".env.example")
-                or part.endswith((".local.json", ".local.env"))
+                lower
+                in {
+                    ".git",
+                    ".codex",
+                    ".claude",
+                    ".claude.json",
+                    ".mcp.json",
+                    ".env",
+                    "config.toml",
+                }
+                or (lower.startswith(".env.") and lower != ".env.example")
+                or lower.endswith(
+                    (".local.json", ".local.env", "-.claude.json", "-config.toml", ".claude.json")
+                )
             ):
                 raise ValueError(f"Private state or client config in package: {name}")
 
