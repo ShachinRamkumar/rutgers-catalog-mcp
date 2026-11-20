@@ -312,10 +312,10 @@ class NJTransferClient:
         try:
             lock.acquire()
         except OSError:
-            yield
+            yield False
             return
         try:
-            yield
+            yield True
         finally:
             lock.release()
 
@@ -323,12 +323,13 @@ class NJTransferClient:
         data_path = self.cache_dir / "middlesex-rutgers-soe-active.txt"
         meta_path = self.cache_dir / "middlesex-rutgers-soe-active.meta.json"
 
-        with self._cache_lock():
+        with self._cache_lock() as locked:
             meta = self._read_meta(meta_path)
             if meta.get("url") and meta["url"] != NJ_TRANSFER_LOOKUP:
                 meta = {**meta, "url": NJ_TRANSFER_LOOKUP}
-                with contextlib.suppress(OSError):
-                    self._atomic_write(meta_path, json.dumps(meta).encode())
+                if locked:
+                    with contextlib.suppress(OSError):
+                        self._atomic_write(meta_path, json.dumps(meta).encode())
             cached_records: list[Equivalency] | None = None
             if data_path.exists():
                 try:
@@ -366,11 +367,12 @@ class NJTransferClient:
                 ) from None
 
             now = datetime.now(tz=UTC)
-            self._atomic_write(data_path, export_text.encode("utf-8"))
-            self._atomic_write(
-                meta_path,
-                json.dumps({"fetched_at": now.isoformat(), "url": NJ_TRANSFER_LOOKUP}).encode(),
-            )
+            if locked:
+                self._atomic_write(data_path, export_text.encode("utf-8"))
+                self._atomic_write(
+                    meta_path,
+                    json.dumps({"fetched_at": now.isoformat(), "url": NJ_TRANSFER_LOOKUP}).encode(),
+                )
             self._detail_cache.clear()
             return records, CacheInfo(source="network", fetched_at=now.isoformat(), stale=False)
 

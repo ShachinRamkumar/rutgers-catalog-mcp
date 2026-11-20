@@ -940,3 +940,63 @@ def test_transfer_read_only_cache_directory_still_serves_fresh_cache(tmp_path: P
     finally:
         if os.name != "nt":
             cache_dir.chmod(0o755)
+
+
+def test_soc_retry_304_with_no_store_evicts_cached_bundle(tmp_path: Path) -> None:
+    cache_file = tmp_path / "courses-2026-9-NB.cache.json"
+    cache_file.write_text(
+        json.dumps(
+            {
+                "meta": {"etag": '"v1"', "max_age": 60, "fetched_at": "2026-08-01"},
+                "payload": [{"courseString": "14:332:331"}],
+            }
+        )
+    )
+    os.utime(cache_file, (1, 1))
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(304, headers={"ETag": '"v2"'})
+        return httpx.Response(304, headers={"Cache-Control": "no-store"})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        client = SocClient(cache_dir=tmp_path, http_client=http)
+        with pytest.raises(SocApiError, match="unconditional GET"):
+            client.get_courses(Term(2026, "fall"), "NB")
+    assert not cache_file.exists()
+
+
+def test_unlocked_clients_do_not_write_and_return_upstream_on_miss(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Occupying the lock path with a directory forces unlocked mode even in a writable dir.
+    soc_dir = tmp_path / "soc"
+    soc_dir.mkdir()
+    (soc_dir / ".courses-2026-9-NB.lock").mkdir()
+    with httpx.Client(
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(200, json=[{"courseString": "14:332:331"}])
+        )
+    ) as http:
+        courses, info = SocClient(cache_dir=soc_dir, http_client=http).get_courses(
+            Term(2026, "fall"), "NB"
+        )
+    assert courses == [{"courseString": "14:332:331"}]
+    assert info.source == "network"
+    assert not (soc_dir / "courses-2026-9-NB.cache.json").exists()
+
+    nj_dir = tmp_path / "nj"
+    nj_dir.mkdir()
+    (nj_dir / ".middlesex-rutgers-soe-active.lock").mkdir()
+    with httpx.Client() as http:
+        client = NJTransferClient(cache_dir=nj_dir, http_client=http)
+        monkeypatch.setattr(
+            client, "_download_export", lambda: (SAMPLE_EXPORT, transfer_client.NJ_TRANSFER_LOOKUP)
+        )
+        records, nj_info = client.get_equivalencies()
+    assert len(records) == 5
+    assert nj_info.source == "network"
+    assert not (nj_dir / "middlesex-rutgers-soe-active.txt").exists()

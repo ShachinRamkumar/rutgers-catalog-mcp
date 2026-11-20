@@ -361,7 +361,8 @@ class SocClient:
 
     def _evict_cache(self, stem: str) -> None:
         for suffix in (".cache.json", ".json", ".meta.json"):
-            (self.cache_dir / f"{stem}{suffix}").unlink(missing_ok=True)
+            with contextlib.suppress(OSError):
+                (self.cache_dir / f"{stem}{suffix}").unlink(missing_ok=True)
 
     def _write_bundle(self, stem: str, payload: Any, meta: dict[str, Any]) -> None:
         bundle_path = self.cache_dir / f"{stem}.cache.json"
@@ -376,10 +377,10 @@ class SocClient:
         try:
             lock.acquire()
         except OSError:
-            yield
+            yield False
             return
         try:
-            yield
+            yield True
         finally:
             lock.release()
 
@@ -393,7 +394,7 @@ class SocClient:
     ) -> tuple[Any, CacheInfo]:
         stem = f"{endpoint.removesuffix('.json')}-{term.year}-{term.code}-{campus}"
 
-        with self._cache_lock(stem):
+        with self._cache_lock(stem) as locked:
             cached_entry = self._read_cache(endpoint, stem)
             cached = cached_entry[0] if cached_entry is not None else None
             meta = cached_entry[1] if cached_entry is not None else {}
@@ -438,6 +439,9 @@ class SocClient:
                             self._evict_cache(stem)
                             cached = None
                         response = self.http.get(url, params=params)
+                        if _has_no_store(response.headers.get("cache-control")):
+                            self._evict_cache(stem)
+                            cached = None
                         if response.status_code == 304:
                             raise _SocProtocolError(
                                 "Rutgers SOC returned 304 to an unconditional GET"
@@ -446,7 +450,7 @@ class SocClient:
                         now = datetime.now(tz=UTC)
                         if _has_no_store(cache_control):
                             self._evict_cache(stem)
-                        else:
+                        elif locked:
                             updated_meta = {
                                 **meta,
                                 "etag": cached_etag,
@@ -457,11 +461,11 @@ class SocClient:
                         return cached, CacheInfo(
                             source="validated_cache", fetched_at=now.isoformat(), stale=False
                         )
-                response.raise_for_status()
                 cache_control = response.headers.get("cache-control")
                 if _has_no_store(cache_control):
                     self._evict_cache(stem)
                     cached = None
+                response.raise_for_status()
                 payload = response.json()
                 self._validate_payload(endpoint, payload)
             except _SocProtocolError:
@@ -478,7 +482,7 @@ class SocClient:
                 raise SocApiError(f"Could not fetch Rutgers SOC data: {exc}") from exc
 
             now = datetime.now(tz=UTC)
-            if not _has_no_store(cache_control):
+            if locked and not _has_no_store(cache_control):
                 new_meta = {
                     "etag": response.headers.get("etag"),
                     "fetched_at": now.isoformat(),
