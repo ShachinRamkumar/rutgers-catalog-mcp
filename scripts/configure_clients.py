@@ -1,7 +1,6 @@
 """Register the three public catalog MCP server executables with local MCP clients."""
 
 import argparse
-import json
 import os
 import shutil
 import subprocess
@@ -26,7 +25,6 @@ def main() -> None:
     bin_dir = root / ".venv" / ("Scripts" if os.name == "nt" else "bin")
     suffix = ".exe" if os.name == "nt" else ""
     commands = {name: bin_dir / f"{executable}{suffix}" for name, executable in SERVERS.items()}
-    definitions = {name: {"command": str(command)} for name, command in commands.items()}
 
     clients = ["codex", "claude"] if args.client == "both" else [args.client]
     for client in clients:
@@ -35,9 +33,7 @@ def main() -> None:
     if not all(path.is_file() for path in commands.values()):
         parser.error("Server executables are missing. Run uv sync --locked in this clone first.")
 
-    config_dir = root / ".codex"
-    config_path = config_dir / "config.toml"
-    configs = [config_path]
+    configs: list[Path] = []
     if "codex" in clients:
         configs.append(
             Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "config.toml"
@@ -59,16 +55,25 @@ def main() -> None:
                 saved.chmod(0o600)
 
     for client in clients:
-        for name, definition in definitions.items():
-            target = definition["command"]
+        for name, command in commands.items():
+            target = str(command)
             if client == "codex":
+                subprocess.run(
+                    [client, "mcp", "remove", name],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
                 subprocess.run([client, "mcp", "add", name, "--", target], check=True)
             else:
-                existing = subprocess.run(
-                    [client, "mcp", "get", name], capture_output=True, text=True, check=False
+                # Remove only at user scope and ignore missing entries so a project/local
+                # definition with the same name never aborts user-scope registration.
+                subprocess.run(
+                    [client, "mcp", "remove", "--scope", "user", name],
+                    capture_output=True,
+                    text=True,
+                    check=False,
                 )
-                if existing.returncode == 0:
-                    subprocess.run([client, "mcp", "remove", "--scope", "user", name], check=True)
                 subprocess.run(
                     [
                         client,
@@ -85,20 +90,7 @@ def main() -> None:
                     check=True,
                 )
 
-    if "codex" in clients:
-        config_dir.mkdir(exist_ok=True)
-        config_path.write_text(
-            "\n\n".join(
-                f"[mcp_servers.{name}]\n"
-                + "\n".join(f"{key} = {json.dumps(value)}" for key, value in definition.items())
-                + "\n"
-                "startup_timeout_sec = 30\ntool_timeout_sec = 120\nenabled = true"
-                for name, definition in definitions.items()
-            )
-            + "\n",
-            encoding="utf-8",
-        )
-    print(f"Configured {len(definitions)} servers for {', '.join(clients)}.")
+    print(f"Configured {len(commands)} servers for {', '.join(clients)}.")
     print(f"Configuration backups: {backup_dir}")
     print("Start a new client session to load the servers.")
 

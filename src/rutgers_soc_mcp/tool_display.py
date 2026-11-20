@@ -1,4 +1,9 @@
-"""Tool labels and response presentation metadata for MCP hosts."""
+"""Tool labels and response presentation metadata for MCP hosts.
+
+`server_display` attaches a lightweight `_meta.source` record to tool-call responses so MCP
+clients that display per-call source attribution can label results consistently across all
+three catalog servers without embedding external URLs or binary icon assets.
+"""
 
 from __future__ import annotations
 

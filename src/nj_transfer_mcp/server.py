@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit
+import logging
 from typing import Any
 
 import httpx
@@ -18,6 +19,7 @@ from nj_transfer_mcp.client import (
     current_equivalencies,
     normalize_middlesex_course_code,
     normalize_rutgers_course_code,
+    sanitize_error,
 )
 from rutgers_soc_mcp.tool_display import server_display, tool_display
 
@@ -57,25 +59,34 @@ def _records():
     return current_equivalencies(records), records, cache_info
 
 
-def _details(matches) -> tuple[dict[tuple[str, str, str], dict[str, Any]], list[str]]:
+MAX_DETAIL_EXPANSIONS = 10
+
+
+def _details(
+    matches,
+) -> tuple[dict[tuple[str, str, str], dict[str, Any]], list[str], bool]:
     details: dict[tuple[str, str, str], dict[str, Any]] = {}
     errors: list[str] = []
-    for item in matches:
+    truncated = len(matches) > MAX_DETAIL_EXPANSIONS
+    for item in matches[:MAX_DETAIL_EXPANSIONS]:
         key = item.detail_key
         try:
             details[key] = _client.get_equivalency_details(item)
         except (NJTransferError, httpx.HTTPError, OSError) as exc:
-            errors.append(f"{item.middlesex_course}: {exc}")
-    return details, errors
+            errors.append(f"{item.middlesex_course}: {sanitize_error(exc)}")
+    return details, errors, truncated
 
 
 def _envelope(matches, cache_info, *, expand_details: bool = False) -> dict[str, Any]:
-    detail_map, detail_errors = _details(matches) if expand_details else ({}, [])
+    detail_map, detail_errors, details_truncated = (
+        _details(matches) if expand_details else ({}, [], False)
+    )
     return {
         "institutions": {"from": SENDING_NAME, "to": RECEIVING_NAME},
         "match_count": len(matches),
         "matches": [item.as_dict(detail_map.get(item.detail_key)) for item in matches],
-        "details_expanded": expand_details and not detail_errors,
+        "details_expanded": expand_details and not detail_errors and not details_truncated,
+        "details_truncated": details_truncated,
         "detail_errors": detail_errors,
         "data": cache_info.as_dict(),
         "official_source": NJ_TRANSFER_LOOKUP,
@@ -121,7 +132,8 @@ def get_middlesex_course_equivalency(
 
     Args:
         middlesex_course_code: Middlesex course ID such as MAT132, MAT-132, or CSC 235.
-        include_history: Include superseded historical evaluations as well as the current one.
+        include_history: Include superseded historical evaluations for this active Middlesex
+            course (inactive/retired courses are excluded from the active NJ Transfer export).
     """
     normalized = normalize_middlesex_course_code(middlesex_course_code)
     if normalized is None:
@@ -177,9 +189,9 @@ def search_equivalencies(
             rank = 1
         elif title == cleaned:
             rank = 2
-        elif mcc.startswith(compact) or title.startswith(cleaned):
+        elif (compact and mcc.startswith(compact)) or title.startswith(cleaned):
             rank = 3
-        elif compact in recompact(mcc) or cleaned in title:
+        elif (compact and compact in recompact(mcc)) or cleaned in title:
             rank = 4
         elif cleaned in raw or cleaned in rutgers_codes:
             rank = 5
@@ -207,6 +219,9 @@ def recompact(value: str) -> str:
 
 def main() -> None:
     """Run the local STDIO MCP server."""
+    # Prevent HTTP client INFO logs from printing transient session query parameters.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     mcp.run()
 
 

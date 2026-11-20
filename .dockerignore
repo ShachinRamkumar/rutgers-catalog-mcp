@@ -15,6 +15,7 @@ scripts/
 .DS_Store
 .codex/
 .claude/
+.claude.json
 .mcp.json
 .env
 .env.*

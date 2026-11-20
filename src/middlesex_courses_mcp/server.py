@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import atexit
+from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
@@ -61,6 +63,7 @@ def list_class_search_options() -> dict[str, Any]:
         "academic_levels": pairs("AcademicLevels"),
         "course_types": pairs("CourseTypes"),
         "days": [item.get("Item1") for item in data.get("DaysOfWeek") or []],
+        "retrieved_at": datetime.now(ZoneInfo("America/New_York")).isoformat(),
         "official_source": CATALOG_URL,
     }
 
@@ -121,7 +124,7 @@ def get_class_details(section_id: str) -> dict[str, Any]:
     """Get prerequisites, fees, meetings, and instructors for one search result.
 
     Args:
-        section_id: Numeric section_id returned by search_classes, e.g. 188940.
+        section_id: Numeric section_id returned by Middlesex_Search_Classes, e.g. 188940.
     """
     return _tool_call(_client.get_class_details, section_id)
 

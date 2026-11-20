@@ -76,7 +76,7 @@ def section_result(section: dict[str, Any], open_indexes: set[str] | None = None
         "open": is_open,
         "instructors": _person_names(section.get("instructors")),
         "meeting_times": [
-            _meeting(item) for item in section.get("meetingTimes", []) if isinstance(item, dict)
+            _meeting(item) for item in (section.get("meetingTimes") or []) if isinstance(item, dict)
         ],
         "campus_locations": _location_names(section.get("sectionCampusLocations")),
         "restrictions": clean_text(section.get("openToText")),
@@ -121,7 +121,7 @@ def course_result(
     section_limit: int = 25,
     section_offset: int = 0,
 ) -> dict[str, Any]:
-    raw_sections = [item for item in course.get("sections", []) if isinstance(item, dict)]
+    raw_sections = [item for item in (course.get("sections") or []) if isinstance(item, dict)]
     sections = [section_result(item, open_indexes) for item in raw_sections]
     open_count = sum(1 for item in sections if item["open"])
     course_code = str(course.get("courseString", ""))
@@ -173,7 +173,7 @@ def course_result(
 
 
 def search_result(course: dict[str, Any], *, term: Term, campus: str) -> dict[str, Any]:
-    sections = [item for item in course.get("sections", []) if isinstance(item, dict)]
+    sections = [item for item in (course.get("sections") or []) if isinstance(item, dict)]
     return {
         "course_code": course.get("courseString"),
         "title": clean_text(course.get("expandedTitle") or course.get("title")),

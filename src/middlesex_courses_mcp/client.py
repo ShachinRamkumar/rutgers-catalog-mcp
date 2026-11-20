@@ -494,7 +494,9 @@ class MiddlesexCatalogClient:
     def get_class_details(self, section_id: str) -> dict[str, Any]:
         cleaned = section_id.strip()
         if not cleaned or not cleaned.isdigit():
-            raise ValueError("section_id must be the numeric ID returned by search_classes")
+            raise ValueError(
+                "section_id must be the numeric ID returned by Middlesex_Search_Classes"
+            )
         data = self._post_json(SECTION_DETAILS_URL, {"sectionId": cleaned, "studentId": None})
         result = normalize_details(data)
         result["retrieved_at"] = datetime.now(ZoneInfo("America/New_York")).isoformat()

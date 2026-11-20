@@ -382,3 +382,195 @@ def test_transfer_export_refresh_invalidates_details(tmp_path: Path, monkeypatch
         client.get_equivalencies()
         client.get_equivalency_details(record)
     assert len(calls) == 2
+
+
+@pytest.mark.anyio
+async def test_transfer_search_punctuation_only_query_returns_no_matches(monkeypatch) -> None:
+    from nj_transfer_mcp import server as transfer_server
+    from nj_transfer_mcp.client import CacheInfo as TransferCacheInfo
+
+    class FakeClient:
+        def get_equivalencies(self):
+            return parse_export(SAMPLE_EXPORT), TransferCacheInfo("cache", "2026-10-03", False)
+
+    monkeypatch.setattr(transfer_server, "_client", FakeClient())
+    async with Client(transfer_server.mcp) as client:
+        result = await client.call_tool("NJTransfer_Search", {"query": "--"})
+    assert not result.is_error
+    assert result.structured_content["match_count"] == 0
+
+
+@pytest.mark.anyio
+async def test_transfer_detail_expansion_is_capped(monkeypatch) -> None:
+    from nj_transfer_mcp import server as transfer_server
+    from nj_transfer_mcp.client import CacheInfo as TransferCacheInfo
+
+    base = current_equivalencies(parse_export(SAMPLE_EXPORT))[-1]
+    many = [
+        replace(base, middlesex_course=f"MAT{100 + i}", rutgers_course_codes=("01:640:152",))
+        for i in range(transfer_server.MAX_DETAIL_EXPANSIONS + 3)
+    ]
+    detail_calls = 0
+
+    class FakeClient:
+        def get_equivalencies(self):
+            return many, TransferCacheInfo("cache", "2026-10-03", False)
+
+        def get_equivalency_details(self, _record):
+            nonlocal detail_calls
+            detail_calls += 1
+            return {"minimum_grade": "C"}
+
+    monkeypatch.setattr(transfer_server, "_client", FakeClient())
+    async with Client(transfer_server.mcp) as client:
+        result = await client.call_tool(
+            "NJTransfer_Find_Middlesex_Equivalents", {"rutgers_course_code": "01:640:152"}
+        )
+    data = result.structured_content
+    assert detail_calls == transfer_server.MAX_DETAIL_EXPANSIONS
+    assert data["details_truncated"] is True
+    assert data["details_expanded"] is False
+
+
+def test_transfer_details_reuse_active_session(tmp_path: Path, monkeypatch) -> None:
+    record = current_equivalencies(parse_export(SAMPLE_EXPORT))[-1]
+    sessions = 0
+
+    def start_session():
+        nonlocal sessions
+        sessions += 1
+        return "999888"
+
+    def handler(_request):
+        return httpx.Response(200, text="MAT132 <strong>Minimum Grade:</strong> C<br/>")
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        client = NJTransferClient(cache_dir=tmp_path, http_client=http)
+        monkeypatch.setattr(client, "_start_session", start_session)
+        client.get_equivalency_details(record)
+        client.get_equivalency_details(replace(record, middlesex_effective_term="202109"))
+    assert sessions == 1
+
+
+def test_transfer_corrupt_fresh_cache_heals_and_redacts_metadata(tmp_path: Path) -> None:
+    (tmp_path / "middlesex-rutgers-soe-active.txt").write_bytes(b"\xff\xfe corrupt export")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.endswith("/precs.cgi"):
+            return httpx.Response(200, text='<meta content="URL=chgri.cgi?77777">')
+        if request.method == "POST" and request.url.path.endswith("/precs.cgi"):
+            return httpx.Response(
+                200,
+                text=(
+                    "Middlesex College Rutgers-School of Engineering "
+                    '<input name="ArtId" value="88888">'
+                ),
+            )
+        if request.method == "POST" and request.url.path.endswith("/listeqs.cgi"):
+            return httpx.Response(
+                200,
+                text=(
+                    '<a href="https://www.njtransfer.org/artweb/tempfiles/'
+                    'EN.MI.88888.listeq.txt">Download</a>'
+                ),
+            )
+        if request.method == "GET" and request.url.path.endswith(".listeq.txt"):
+            return httpx.Response(200, text=SAMPLE_EXPORT)
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        records, info = NJTransferClient(cache_dir=tmp_path, http_client=http).get_equivalencies()
+    assert len(records) == 5
+    assert info.source == "network"
+    meta = json.loads((tmp_path / "middlesex-rutgers-soe-active.meta.json").read_text())
+    assert "88888" not in meta["url"]
+    assert meta["url"] == transfer_client.NJ_TRANSFER_LOOKUP
+
+
+def test_transfer_error_sanitization_redacts_session_ids() -> None:
+    raw = (
+        "Client error for url "
+        "'https://www.njtransfer.org/artweb/crs-srch.cgi?Z~987654~MI~EN~MAT132' "
+        "and 'https://www.njtransfer.org/artweb/tempfiles/EN.MI.987654.listeq.txt'"
+    )
+    sanitized = transfer_client.sanitize_error(raw)
+    assert "987654" not in sanitized
+    assert "<redacted>" in sanitized
+
+
+def test_soc_rejects_null_sections_and_honors_no_store(tmp_path: Path) -> None:
+    with httpx.Client(
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(200, json=[{"courseString": "14:332:331", "sections": None}])
+        )
+    ) as http:
+        client = SocClient(cache_dir=tmp_path, http_client=http)
+        with pytest.raises(SocApiError):
+            client.get_courses(Term(2026, "fall"), "NB")
+    assert not (tmp_path / "courses-2026-9-NB.json").exists()
+
+    with httpx.Client(
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(
+                200,
+                json=[{"courseString": "14:332:331", "sections": []}],
+                headers={"Cache-Control": "no-store, max-age=900"},
+            )
+        )
+    ) as http:
+        courses, info = SocClient(cache_dir=tmp_path, http_client=http).get_courses(
+            Term(2026, "fall"), "NB"
+        )
+    assert courses[0]["courseString"] == "14:332:331"
+    assert info.source == "network"
+    assert not (tmp_path / "courses-2026-9-NB.json").exists()
+
+
+@pytest.mark.anyio
+async def test_middlesex_search_options_includes_retrieval_timestamp(monkeypatch) -> None:
+    from middlesex_courses_mcp import server as middlesex_server
+    from tests.test_middlesex_courses_server import FakeMiddlesexClient
+
+    monkeypatch.setattr(middlesex_server, "_client", FakeMiddlesexClient())
+    async with Client(middlesex_server.mcp) as client:
+        result = await client.call_tool("Middlesex_Search_Options", {})
+    assert not result.is_error
+    assert result.structured_content["retrieved_at"]
+
+
+def test_verify_package_rejects_nested_private_client_configs(tmp_path: Path) -> None:
+    import io
+    import runpy
+    import tarfile
+    import zipfile
+
+    script = runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts/verify_package.py"))
+    check_archives = script["check_archives"]
+
+    clean_sdist = tmp_path / "clean.tar.gz"
+    with tarfile.open(clean_sdist, "w:gz") as tar:
+        info = tarfile.TarInfo("pkg-0.1.0/README.md")
+        data = b"ok"
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+
+    bad_wheel = tmp_path / "bad.whl"
+    with zipfile.ZipFile(bad_wheel, "w") as zf:
+        zf.writestr("rutgers_soc_mcp/.claude.json", "{}")
+
+    with pytest.raises(ValueError, match="Private state or client config"):
+        check_archives(bad_wheel, clean_sdist)
+
+    bad_sdist = tmp_path / "bad.tar.gz"
+    with tarfile.open(bad_sdist, "w:gz") as tar:
+        info = tarfile.TarInfo("pkg-0.1.0/src/.codex/config.toml")
+        data = b"model = 'x'"
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+
+    clean_wheel = tmp_path / "clean.whl"
+    with zipfile.ZipFile(clean_wheel, "w") as zf:
+        zf.writestr("rutgers_soc_mcp/__init__.py", "")
+
+    with pytest.raises(ValueError, match="Private state or client config"):
+        check_archives(clean_wheel, bad_sdist)

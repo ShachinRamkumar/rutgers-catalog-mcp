@@ -54,8 +54,13 @@ def check_archives(wheel: Path, source: Path) -> None:
 
     def check_private_path(name: str) -> None:
         parts = Path(name).parts
-        if any(part == ".git" or part.endswith(".local.json") for part in parts):
-            raise ValueError(f"Private state or repository history in package: {name}")
+        for part in parts:
+            if (
+                part in {".git", ".codex", ".claude", ".claude.json", ".mcp.json", ".env"}
+                or (part.startswith(".env.") and part != ".env.example")
+                or part.endswith((".local.json", ".local.env"))
+            ):
+                raise ValueError(f"Private state or client config in package: {name}")
 
     with tarfile.open(source) as archive:
         for member in archive.getmembers():

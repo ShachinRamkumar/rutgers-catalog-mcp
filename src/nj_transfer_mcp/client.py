@@ -17,6 +17,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 import httpx
+from filelock import FileLock
 from platformdirs import user_cache_path
 
 NJ_TRANSFER_BASE = "https://www.njtransfer.org"
@@ -49,6 +50,21 @@ _MINIMUM_GRADE_RE = re.compile(
 )
 _TAG_RE = re.compile(r"<[^>]+>")
 _SPACE_RE = re.compile(r"\s+")
+_SESSION_PATTERNS = (
+    (re.compile(r"(precs\.cgi|chgri\.cgi)\?\d+", re.IGNORECASE), r"\1?<redacted>"),
+    (re.compile(r"(crs-srch\.cgi\?Z~)\d+(~)", re.IGNORECASE), r"\1<redacted>\2"),
+    (re.compile(r"(tempfiles/)[^/\s\"']+", re.IGNORECASE), r"\1<redacted>"),
+    (re.compile(r"(ArtId=)\d+", re.IGNORECASE), r"\1<redacted>"),
+)
+
+
+def sanitize_error(message: Any) -> str:
+    """Redact transient NJ Transfer session identifiers from error messages."""
+    text = str(message)
+    for pattern, replacement in _SESSION_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
 
 _TERM_MONTHS = {
     "01": "Winter",
@@ -278,6 +294,7 @@ class NJTransferClient:
             },
         )
         self._owns_http_client = http_client is None
+        self._art_id: str | None = None
         self._detail_cache: dict[tuple[str, str, str], tuple[float, dict[str, Any]]] = {}
 
     def close(self) -> None:
@@ -287,39 +304,54 @@ class NJTransferClient:
     def get_equivalencies(self) -> tuple[list[Equivalency], CacheInfo]:
         data_path = self.cache_dir / "middlesex-rutgers-soe-active.txt"
         meta_path = self.cache_dir / "middlesex-rutgers-soe-active.meta.json"
-        meta = self._read_meta(meta_path)
+        lock = FileLock(str(self.cache_dir / ".middlesex-rutgers-soe-active.lock"))
 
-        if data_path.exists():
-            age = datetime.now(tz=UTC).timestamp() - data_path.stat().st_mtime
-            if age <= self.max_age_seconds:
-                return parse_export(data_path.read_text(encoding="utf-8")), CacheInfo(
-                    source="cache",
-                    fetched_at=meta.get("fetched_at", _iso_timestamp(data_path.stat().st_mtime)),
-                    stale=False,
-                )
-
-        try:
-            export_text, source_url = self._download_export()
-            records = parse_export(export_text)
-        except (httpx.HTTPError, NJTransferError, OSError, UnicodeError) as exc:
+        with lock:
+            meta = self._read_meta(meta_path)
+            cached_records: list[Equivalency] | None = None
             if data_path.exists():
-                return parse_export(data_path.read_text(encoding="utf-8")), CacheInfo(
-                    source="stale_cache",
-                    fetched_at=meta.get("fetched_at", _iso_timestamp(data_path.stat().st_mtime)),
-                    stale=True,
-                )
-            if isinstance(exc, NJTransferError):
-                raise
-            raise NJTransferError(f"Could not fetch NJ Transfer equivalencies: {exc}") from exc
+                try:
+                    cached_records = parse_export(data_path.read_text(encoding="utf-8"))
+                except (NJTransferError, OSError, UnicodeError):
+                    cached_records = None
 
-        now = datetime.now(tz=UTC)
-        self._atomic_write(data_path, export_text.encode("utf-8"))
-        self._atomic_write(
-            meta_path,
-            json.dumps({"fetched_at": now.isoformat(), "url": source_url}).encode(),
-        )
-        self._detail_cache.clear()
-        return records, CacheInfo(source="network", fetched_at=now.isoformat(), stale=False)
+            if cached_records is not None:
+                age = datetime.now(tz=UTC).timestamp() - data_path.stat().st_mtime
+                if age <= self.max_age_seconds:
+                    return cached_records, CacheInfo(
+                        source="cache",
+                        fetched_at=meta.get(
+                            "fetched_at", _iso_timestamp(data_path.stat().st_mtime)
+                        ),
+                        stale=False,
+                    )
+
+            try:
+                export_text, _source_url = self._download_export()
+                records = parse_export(export_text)
+            except (httpx.HTTPError, NJTransferError, OSError, UnicodeError) as exc:
+                if cached_records is not None:
+                    return cached_records, CacheInfo(
+                        source="stale_cache",
+                        fetched_at=meta.get(
+                            "fetched_at", _iso_timestamp(data_path.stat().st_mtime)
+                        ),
+                        stale=True,
+                    )
+                if isinstance(exc, NJTransferError):
+                    raise NJTransferError(sanitize_error(exc)) from exc
+                raise NJTransferError(
+                    f"Could not fetch NJ Transfer equivalencies: {sanitize_error(exc)}"
+                ) from exc
+
+            now = datetime.now(tz=UTC)
+            self._atomic_write(data_path, export_text.encode("utf-8"))
+            self._atomic_write(
+                meta_path,
+                json.dumps({"fetched_at": now.isoformat(), "url": NJ_TRANSFER_LOOKUP}).encode(),
+            )
+            self._detail_cache.clear()
+            return records, CacheInfo(source="network", fetched_at=now.isoformat(), stale=False)
 
     def get_equivalency_details(self, record: Equivalency) -> dict[str, Any]:
         """Fetch minimum-grade, footnote text, and linked-course requirements."""
@@ -329,20 +361,35 @@ class NJTransferClient:
             result = cached[1]
             return {**result, "data": {**result["data"], "source": "cache"}}
 
-        art_id = self._start_session()
         sending_term = _term_query_label(record.middlesex_effective_term)
         receiving_term = _term_query_label(record.rutgers_evaluation_effective_term)
-        detail_url = (
-            f"{NJ_TRANSFER_BASE}/artweb/crs-srch.cgi?Z~{art_id}~{SENDING_CODE}~"
-            f"{RECEIVING_CODE}~{record.middlesex_course}~{sending_term}~{receiving_term}~"
-        )
-        response = self.http.get(detail_url)
-        response.raise_for_status()
-        if record.middlesex_course not in response.text:
-            raise NJTransferError(
-                f"NJ Transfer did not return details for {record.middlesex_course}"
+        response: httpx.Response | None = None
+        for attempt in range(2):
+            art_id = self._art_id or self._start_session()
+            self._art_id = art_id
+            detail_url = (
+                f"{NJ_TRANSFER_BASE}/artweb/crs-srch.cgi?Z~{art_id}~{SENDING_CODE}~"
+                f"{RECEIVING_CODE}~{record.middlesex_course}~{sending_term}~{receiving_term}~"
             )
+            try:
+                response = self.http.get(detail_url)
+                response.raise_for_status()
+            except httpx.HTTPError as exc:
+                self._art_id = None
+                if attempt == 0:
+                    continue
+                raise NJTransferError(
+                    f"Could not fetch details for {record.middlesex_course}: {sanitize_error(exc)}"
+                ) from exc
+            if record.middlesex_course in response.text:
+                break
+            self._art_id = None
+            if attempt == 1:
+                raise NJTransferError(
+                    f"NJ Transfer did not return details for {record.middlesex_course}"
+                )
 
+        assert response is not None
         grade_match = _MINIMUM_GRADE_RE.search(response.text)
         footnote_details = [
             {"code": _clean_html(code), "text": _clean_html(description)}
@@ -359,7 +406,7 @@ class NJTransferClient:
         return result
 
     def _download_export(self) -> tuple[str, str]:
-        self._start_session()
+        self._art_id = self._start_session()
 
         listing = self.http.post(
             f"{NJ_TRANSFER_BASE}/artweb/listeqs.cgi?{SENDING_CODE}+{RECEIVING_CODE}",
@@ -376,7 +423,7 @@ class NJTransferClient:
             raise NJTransferError("NJ Transfer returned an unsafe export URL")
         exported = self.http.get(download_url)
         exported.raise_for_status()
-        return exported.text, download_url
+        return exported.text, NJ_TRANSFER_LOOKUP
 
     def _start_session(self) -> str:
         entry = self.http.get(NJ_TRANSFER_LOOKUP)

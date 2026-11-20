@@ -14,6 +14,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import httpx
+from filelock import FileLock
 from platformdirs import user_cache_path
 
 SOC_API_BASE = "https://classes.rutgers.edu/soc/api"
@@ -215,6 +216,12 @@ def _parse_max_age(cache_control: str | None, fallback: int) -> int:
     return fallback
 
 
+def _has_no_store(cache_control: str | None) -> bool:
+    if not cache_control:
+        return False
+    return bool(re.search(r"(?:^|,)\s*no-store(?:\s*,|$)", cache_control, re.IGNORECASE))
+
+
 class SocClient:
     """Fetch Rutgers SOC JSON with conditional requests and a local disk cache."""
 
@@ -272,6 +279,7 @@ class SocClient:
                 isinstance(item, dict)
                 and isinstance(item.get("courseString"), str)
                 and bool(item["courseString"])
+                and ("sections" not in item or isinstance(item["sections"], list))
                 for item in payload
             )
         elif valid:
@@ -294,72 +302,83 @@ class SocClient:
         stem = f"{endpoint.removesuffix('.json')}-{term.year}-{term.code}-{campus}"
         data_path = self.cache_dir / f"{stem}.json"
         meta_path = self.cache_dir / f"{stem}.meta.json"
-        meta = self._read_meta(meta_path)
-        cached = None
-        if data_path.exists():
-            try:
-                cached = self._read_json(data_path)
-                self._validate_payload(endpoint, cached)
-            except SocApiError:
-                cached = None
+        lock = FileLock(str(self.cache_dir / f".{stem}.lock"))
 
-        max_age = fallback_max_age
-        if cached is not None:
-            age = datetime.now(tz=UTC).timestamp() - data_path.stat().st_mtime
-            try:
-                max_age = int(meta.get("max_age", fallback_max_age))
-            except (TypeError, ValueError):
-                max_age = fallback_max_age
-            if age <= max_age:
-                return cached, CacheInfo(
-                    source="cache",
-                    fetched_at=meta.get("fetched_at", _iso_timestamp(data_path.stat().st_mtime)),
-                    stale=False,
-                )
+        with lock:
+            meta = self._read_meta(meta_path)
+            cached = None
+            if data_path.exists():
+                try:
+                    cached = self._read_json(data_path)
+                    self._validate_payload(endpoint, cached)
+                except SocApiError:
+                    cached = None
 
-        headers: dict[str, str] = {}
-        if cached is not None and meta.get("etag"):
-            headers["If-None-Match"] = str(meta["etag"])
-
-        url = f"{SOC_API_BASE}/{endpoint}"
-        params = {"year": term.year, "term": term.code, "campus": campus}
-        try:
-            response = self.http.get(url, params=params, headers=headers)
-            if response.status_code == 304 and cached is not None:
-                now = datetime.now(tz=UTC)
-                os.utime(data_path, (now.timestamp(), now.timestamp()))
-                updated_meta = {
-                    **meta,
-                    "fetched_at": now.isoformat(),
-                    "max_age": _parse_max_age(response.headers.get("cache-control"), max_age),
-                }
-                self._atomic_write(meta_path, json.dumps(updated_meta).encode())
-                return cached, CacheInfo(
-                    source="validated_cache", fetched_at=now.isoformat(), stale=False
-                )
-            response.raise_for_status()
-            payload = response.json()
-            self._validate_payload(endpoint, payload)
-        except (httpx.HTTPError, ValueError, SocApiError) as exc:
+            max_age = fallback_max_age
             if cached is not None:
-                return cached, CacheInfo(
-                    source="stale_cache",
-                    fetched_at=meta.get("fetched_at", _iso_timestamp(data_path.stat().st_mtime)),
-                    stale=True,
-                )
-            raise SocApiError(f"Could not fetch Rutgers SOC data: {exc}") from exc
+                age = datetime.now(tz=UTC).timestamp() - data_path.stat().st_mtime
+                try:
+                    max_age = int(meta.get("max_age", fallback_max_age))
+                except (TypeError, ValueError):
+                    max_age = fallback_max_age
+                if age <= max_age:
+                    return cached, CacheInfo(
+                        source="cache",
+                        fetched_at=meta.get(
+                            "fetched_at", _iso_timestamp(data_path.stat().st_mtime)
+                        ),
+                        stale=False,
+                    )
 
-        now = datetime.now(tz=UTC)
-        serialized = json.dumps(payload, separators=(",", ":")).encode()
-        new_meta = {
-            "etag": response.headers.get("etag"),
-            "fetched_at": now.isoformat(),
-            "max_age": _parse_max_age(response.headers.get("cache-control"), fallback_max_age),
-            "url": str(response.url),
-        }
-        self._atomic_write(data_path, serialized)
-        self._atomic_write(meta_path, json.dumps(new_meta).encode())
-        return payload, CacheInfo(source="network", fetched_at=now.isoformat(), stale=False)
+            headers: dict[str, str] = {}
+            if cached is not None and meta.get("etag"):
+                headers["If-None-Match"] = str(meta["etag"])
+
+            url = f"{SOC_API_BASE}/{endpoint}"
+            params = {"year": term.year, "term": term.code, "campus": campus}
+            try:
+                response = self.http.get(url, params=params, headers=headers)
+                if response.status_code == 304 and cached is not None:
+                    now = datetime.now(tz=UTC)
+                    cache_control = response.headers.get("cache-control")
+                    if not _has_no_store(cache_control):
+                        os.utime(data_path, (now.timestamp(), now.timestamp()))
+                        updated_meta = {
+                            **meta,
+                            "fetched_at": now.isoformat(),
+                            "max_age": _parse_max_age(cache_control, max_age),
+                        }
+                        self._atomic_write(meta_path, json.dumps(updated_meta).encode())
+                    return cached, CacheInfo(
+                        source="validated_cache", fetched_at=now.isoformat(), stale=False
+                    )
+                response.raise_for_status()
+                payload = response.json()
+                self._validate_payload(endpoint, payload)
+            except (httpx.HTTPError, ValueError, SocApiError) as exc:
+                if cached is not None:
+                    return cached, CacheInfo(
+                        source="stale_cache",
+                        fetched_at=meta.get(
+                            "fetched_at", _iso_timestamp(data_path.stat().st_mtime)
+                        ),
+                        stale=True,
+                    )
+                raise SocApiError(f"Could not fetch Rutgers SOC data: {exc}") from exc
+
+            now = datetime.now(tz=UTC)
+            cache_control = response.headers.get("cache-control")
+            if not _has_no_store(cache_control):
+                serialized = json.dumps(payload, separators=(",", ":")).encode()
+                new_meta = {
+                    "etag": response.headers.get("etag"),
+                    "fetched_at": now.isoformat(),
+                    "max_age": _parse_max_age(cache_control, fallback_max_age),
+                    "url": str(response.url),
+                }
+                self._atomic_write(data_path, serialized)
+                self._atomic_write(meta_path, json.dumps(new_meta).encode())
+            return payload, CacheInfo(source="network", fetched_at=now.isoformat(), stale=False)
 
     @staticmethod
     def _read_json(path: Path) -> Any:
