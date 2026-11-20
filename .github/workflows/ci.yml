@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ['3.11', '3.14']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+      - run: uv run pytest
+      - run: uv run ruff check src tests scripts
+      - run: uv run ruff format --check src tests scripts
+      - run: uv build
+      - run: uv run python scripts/verify_package.py
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build Docker image
+        run: docker build -t rutgers-catalog-mcp:ci .
+      - name: Smoke-test all 3 MCP server entrypoints in container
+        run: |
+          docker run --rm --entrypoint /app/.venv/bin/python rutgers-catalog-mcp:ci -c "
+          import asyncio
+          from mcp.client.session import ClientSession
+          from mcp.client.stdio import StdioServerParameters, stdio_client
+
+          EXPECTED = {
+              'rutgers-soc-mcp': {'SoC_Get_Course', 'SoC_Search_Courses'},
+              'middlesex-courses-mcp': {
+                  'Middlesex_Search_Options',
+                  'Middlesex_Search_Classes',
+                  'Middlesex_Class_Details',
+              },
+              'nj-transfer-mcp': {
+                  'NJTransfer_Find_Middlesex_Equivalents',
+                  'NJTransfer_Middlesex_Course',
+                  'NJTransfer_Search',
+              },
+          }
+
+          async def main():
+              for exe, expected in EXPECTED.items():
+                  async with (
+                      stdio_client(StdioServerParameters(command=exe)) as (read, write),
+                      ClientSession(read, write, read_timeout_seconds=30) as session,
+                  ):
+                      await session.initialize()
+                      tools = {t.name for t in (await session.list_tools()).tools}
+                      assert tools == expected, f'{exe}: expected {expected}, got {tools}'
+                      print(f'Docker smoke test passed: {exe} ({len(tools)} tools)')
+
+          asyncio.run(main())
+          "

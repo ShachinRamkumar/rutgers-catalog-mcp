@@ -1,0 +1,384 @@
+import copy
+import json
+import os
+from dataclasses import replace
+from pathlib import Path
+
+import httpx
+import pytest
+from mcp import Client
+
+from middlesex_courses_mcp.client import MiddlesexCatalogClient
+from nj_transfer_mcp import client as transfer_client
+from nj_transfer_mcp.client import NJTransferClient, current_equivalencies, parse_export
+from rutgers_soc_mcp import server
+from rutgers_soc_mcp.client import CacheInfo, SocApiError, SocClient, Term
+from rutgers_soc_mcp.presentation import section_result
+from tests.test_middlesex_courses_client import OPTIONS, SECTION
+from tests.test_nj_transfer_client import SAMPLE_EXPORT
+from tests.test_server import SAMPLE_COURSE
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
+
+def test_rutgers_thursday_uses_full_weekday() -> None:
+    result = section_result({"meetingTimes": [{"meetingDay": "H"}]})
+    assert result["meeting_times"][0]["day"] == "Thursday"
+
+
+@pytest.mark.parametrize("limit", [1, 7, 10, 20, 29, 30])
+@pytest.mark.parametrize("total", [0, 31, 63])
+def test_middlesex_pagination_reaches_every_match(monkeypatch, limit: int, total: int) -> None:
+    all_sections = [{**SECTION, "Id": str(index)} for index in range(1, total + 1)]
+    with httpx.Client() as http:
+        client = MiddlesexCatalogClient(http_client=http)
+        monkeypatch.setattr(client, "get_search_options", lambda: OPTIONS)
+
+        def post(_url, payload):
+            size = 30
+            start = (payload["pageNumber"] - 1) * size
+            return {
+                "Sections": all_sections[start : start + size],
+                "TotalItems": len(all_sections),
+                "TotalPages": (len(all_sections) + size - 1) // size,
+                "CurrentPageIndex": payload["pageNumber"],
+                "PageSize": size,
+            }
+
+        monkeypatch.setattr(client, "_post_json", post)
+        first = client.search_classes(term="26/FA", limit=limit)
+        assert first["total_pages"] == (len(all_sections) + limit - 1) // limit
+        assert first["returned"] <= limit
+        pages = [first] + [
+            client.search_classes(term="26/FA", page=page, limit=limit)
+            for page in range(2, first["total_pages"] + 1)
+        ]
+        assert all(page["returned"] <= limit for page in pages)
+        beyond = client.search_classes(term="26/FA", limit=limit, page=first["total_pages"] + 1)
+        assert beyond["classes"] == []
+    ids = [item["section_id"] for page in pages for item in page["classes"]]
+    assert ids == [str(index) for index in range(1, total + 1)]
+
+
+@pytest.mark.parametrize("course_stale, availability_stale", [(True, False), (False, True)])
+@pytest.mark.anyio
+async def test_course_and_availability_freshness_stay_separate(
+    monkeypatch, course_stale: bool, availability_stale: bool
+) -> None:
+    class FakeClient:
+        def get_courses(self, *_):
+            return [SAMPLE_COURSE], CacheInfo("cache", "2026-08-01", course_stale)
+
+        def get_open_sections(self, *_):
+            return {"17422"}, CacheInfo("network", "2026-09-04", availability_stale)
+
+    monkeypatch.setattr(server, "_client", FakeClient())
+    async with Client(server.mcp) as client:
+        result = await client.call_tool(
+            "SoC_Get_Course", {"course_code": "14:332:331", "include_sections": True}
+        )
+    data = result.structured_content
+    assert not result.is_error
+    assert data["data"]["stale"] is True
+    assert data["data"]["fetched_at"] == "2026-08-01"
+    assert data["availability_data"]["stale"] is availability_stale
+    assert data["section_summary"]["availability_is_live_overlay"] is not availability_stale
+
+
+@pytest.mark.parametrize("endpoint", ["courses", "openSections"])
+def test_bad_upstream_payload_preserves_valid_cache(tmp_path: Path, endpoint: str) -> None:
+    good = [{"courseString": "14:332:331"}] if endpoint == "courses" else [17422]
+    calls = 0
+
+    def handler(_request):
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json=good if calls == 1 else {"error": "failure"})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        client = SocClient(cache_dir=tmp_path, http_client=http)
+        fetch = client.get_courses if endpoint == "courses" else client.get_open_sections
+        original, _ = fetch(Term(2026, "fall"), "NB")
+        path = tmp_path / f"{endpoint}-2026-9-NB.json"
+        os.utime(path, (1, 1))
+        for _ in range(2):
+            result, info = fetch(Term(2026, "fall"), "NB")
+            assert result == original
+            assert info.stale is True
+            assert json.loads(path.read_text()) == good
+
+
+@pytest.mark.parametrize("bad", [{"error": "failure"}, [None], [{"bad": "record"}]])
+def test_invalid_courses_are_not_cached(tmp_path: Path, bad) -> None:
+    with httpx.Client(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json=bad))
+    ) as http:
+        client = SocClient(cache_dir=tmp_path, http_client=http)
+        with pytest.raises(SocApiError):
+            client.get_courses(Term(2026, "fall"), "NB")
+    assert not (tmp_path / "courses-2026-9-NB.json").exists()
+
+
+@pytest.mark.parametrize("content", [b"broken JSON", b'{"error":"old bad response"}', b"\xff"])
+def test_corrupted_cache_is_replaced_from_network(tmp_path: Path, content: bytes) -> None:
+    path = tmp_path / "courses-2026-9-NB.json"
+    path.write_bytes(content)
+    with httpx.Client(
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(200, json=[{"courseString": "14:332:331"}])
+        )
+    ) as http:
+        courses, info = SocClient(cache_dir=tmp_path, http_client=http).get_courses(
+            Term(2026, "fall"), "NB"
+        )
+    assert courses[0]["courseString"] == "14:332:331"
+    assert info.source == "network"
+
+
+@pytest.mark.anyio
+async def test_rutgers_section_pagination_reaches_every_section(monkeypatch) -> None:
+    course = copy.deepcopy(SAMPLE_COURSE)
+    course["sections"] = [{"index": str(index), "number": str(index)} for index in range(63)]
+
+    class FakeClient:
+        def get_courses(self, *_):
+            return [course], CacheInfo("test", "2026-10-03", False)
+
+        def get_open_sections(self, *_):
+            return {"62"}, CacheInfo("network", "2026-10-03", False)
+
+    monkeypatch.setattr(server, "_client", FakeClient())
+    indexes = []
+    offset = 0
+    async with Client(server.mcp) as client:
+        while offset is not None:
+            result = await client.call_tool(
+                "SoC_Get_Course",
+                {
+                    "course_code": "14:332:331",
+                    "include_sections": True,
+                    "section_offset": offset,
+                },
+            )
+            assert not result.is_error
+            data = result.structured_content
+            indexes.extend(item["index"] for item in data["sections"])
+            offset = data["next_section_offset"]
+    assert indexes == [str(index) for index in range(63)]
+    assert data["sections"][-1]["open"] is True
+
+
+@pytest.mark.anyio
+async def test_rutgers_lecture_lab_variants_are_accessible(monkeypatch) -> None:
+    lecture = {**SAMPLE_COURSE, "supplementCode": "  "}
+    lab = {**SAMPLE_COURSE, "supplementCode": "LB", "credits": 0}
+
+    class FakeClient:
+        def get_courses(self, *_):
+            return [lecture, lab], CacheInfo("test", "2026-10-03", False)
+
+    monkeypatch.setattr(server, "_client", FakeClient())
+    async with Client(server.mcp) as client:
+        all_records = await client.call_tool("SoC_Get_Course", {"course_code": "14:332:331"})
+        selected = await client.call_tool(
+            "SoC_Get_Course", {"course_code": "14:332:331", "supplement": "LB"}
+        )
+        main = await client.call_tool(
+            "SoC_Get_Course", {"course_code": "14:332:331", "supplement": ""}
+        )
+    assert not all_records.is_error
+    assert [item["supplement"] for item in all_records.structured_content["variants"]] == ["", "LB"]
+    assert selected.structured_content["credits"] == 0
+    assert main.structured_content["credits"] == 3
+
+
+def test_transfer_details_expire_and_preserve_provenance(tmp_path: Path, monkeypatch) -> None:
+    record = next(
+        r
+        for r in current_equivalencies(parse_export(SAMPLE_EXPORT))
+        if r.middlesex_course == "MAT132"
+    )
+    clock = [0.0]
+    calls = []
+    monkeypatch.setattr(transfer_client, "monotonic", lambda: clock[0], raising=False)
+
+    def handler(request):
+        calls.append(request)
+        grade = "C" if len(calls) == 1 else "B"
+        return httpx.Response(200, text=f"MAT132 <strong>Minimum Grade:</strong> {grade}<br/>")
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        client = NJTransferClient(cache_dir=tmp_path, http_client=http)
+        monkeypatch.setattr(client, "_start_session", lambda: "123")
+        first = client.get_equivalency_details(record)
+        clock[0] = 10
+        cached = client.get_equivalency_details(record)
+        assert cached["minimum_grade"] == "C"
+        assert len(calls) == 1
+        assert cached["data"]["source"] == "cache"
+        assert cached["data"]["fetched_at"] == first["data"]["fetched_at"]
+        clock[0] = 901
+        refreshed = client.get_equivalency_details(record)
+    assert refreshed["minimum_grade"] == "B"
+    assert len(calls) == 2
+    assert refreshed["data"]["source"] == "network"
+
+
+def test_rutgers_revalidation_uses_etag_and_retains_cache_hint(tmp_path: Path) -> None:
+    path = tmp_path / "courses-2026-9-NB.json"
+    path.write_text('[{"courseString":"14:332:331"}]')
+    os.utime(path, (1, 1))
+    (tmp_path / "courses-2026-9-NB.meta.json").write_text(
+        '{"etag":"test-etag","max_age":1200,"fetched_at":"2026-08-01"}'
+    )
+
+    def handler(request):
+        assert request.headers["If-None-Match"] == "test-etag"
+        return httpx.Response(304, headers={"Cache-Control": "max-age=1800"})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        result, info = SocClient(cache_dir=tmp_path, http_client=http).get_courses(
+            Term(2026, "fall"), "NB"
+        )
+    assert result[0]["courseString"] == "14:332:331"
+    assert info.source == "validated_cache"
+    assert info.stale is False
+    assert json.loads((tmp_path / "courses-2026-9-NB.meta.json").read_text())["max_age"] == 1800
+
+
+@pytest.mark.anyio
+async def test_rutgers_overlay_failure_uses_timestamped_course_snapshot(monkeypatch) -> None:
+    class FakeClient:
+        def get_courses(self, *_):
+            return [SAMPLE_COURSE], CacheInfo("cache", "2026-08-01", False)
+
+        def get_open_sections(self, *_):
+            raise SocApiError("offline")
+
+    monkeypatch.setattr(server, "_client", FakeClient())
+    async with Client(server.mcp) as client:
+        result = await client.call_tool(
+            "SoC_Get_Course", {"course_code": "14:332:331", "include_sections": True}
+        )
+    data = result.structured_content
+    assert data["availability_data"] is None
+    assert data["section_summary"]["availability_is_live_overlay"] is False
+    assert data["sections"][0]["open"] is False
+    assert data["course_data"]["fetched_at"] == "2026-08-01"
+
+
+@pytest.mark.anyio
+async def test_rutgers_schoolless_ambiguity_lists_distinct_full_codes(monkeypatch) -> None:
+    class FakeClient:
+        def get_courses(self, *_):
+            return [SAMPLE_COURSE, {**SAMPLE_COURSE, "courseString": "01:332:331"}], CacheInfo(
+                "test", "2026-10-03", False
+            )
+
+    monkeypatch.setattr(server, "_client", FakeClient())
+    async with Client(server.mcp) as client:
+        result = await client.call_tool("SoC_Get_Course", {"course_code": "332:331"})
+    assert result.is_error
+    assert "01:332:331, 14:332:331" in result.content[0].text
+
+
+@pytest.mark.parametrize(
+    "arguments", [{"section_offset": -1}, {"section_limit": 0}, {"section_limit": 101}]
+)
+@pytest.mark.anyio
+async def test_rutgers_invalid_pagination_is_a_tool_error(arguments) -> None:
+    async with Client(server.mcp) as client:
+        result = await client.call_tool(
+            "SoC_Get_Course", {"course_code": "14:332:331", **arguments}
+        )
+    assert result.is_error
+
+
+@pytest.mark.anyio
+async def test_transfer_detail_failure_does_not_claim_expansion(monkeypatch) -> None:
+    from nj_transfer_mcp import server as transfer_server
+    from nj_transfer_mcp.client import CacheInfo as TransferCacheInfo
+    from nj_transfer_mcp.client import NJTransferError
+
+    class FakeClient:
+        def get_equivalencies(self):
+            return parse_export(SAMPLE_EXPORT), TransferCacheInfo("cache", "2026-10-03", False)
+
+        def get_equivalency_details(self, _record):
+            raise NJTransferError("details unavailable")
+
+    monkeypatch.setattr(transfer_server, "_client", FakeClient())
+    async with Client(transfer_server.mcp) as client:
+        result = await client.call_tool(
+            "NJTransfer_Middlesex_Course", {"middlesex_course_code": "MAT132"}
+        )
+    assert result.structured_content["details_expanded"] is False
+    assert result.structured_content["detail_errors"] == ["MAT132: details unavailable"]
+    assert result.structured_content["matches"][0]["detail_data"] is None
+
+
+@pytest.mark.anyio
+async def test_transfer_history_keeps_distinct_sending_term_details(monkeypatch) -> None:
+    from nj_transfer_mcp import server as transfer_server
+    from nj_transfer_mcp.client import CacheInfo as TransferCacheInfo
+
+    record = current_equivalencies(parse_export(SAMPLE_EXPORT))[-1]
+
+    class FakeClient:
+        def get_equivalencies(self):
+            return [record, replace(record, middlesex_effective_term="202109")], TransferCacheInfo(
+                "cache", "2026-10-03", False
+            )
+
+        def get_equivalency_details(self, evaluation):
+            return {
+                "minimum_grade": "B" if evaluation.middlesex_effective_term == "202109" else "C"
+            }
+
+    monkeypatch.setattr(transfer_server, "_client", FakeClient())
+    async with Client(transfer_server.mcp) as client:
+        result = await client.call_tool(
+            "NJTransfer_Middlesex_Course",
+            {"middlesex_course_code": "MAT132", "include_history": True},
+        )
+    assert [item["minimum_grade"] for item in result.structured_content["matches"]] == ["B", "C"]
+
+
+def test_transfer_cache_distinguishes_sending_term(tmp_path: Path, monkeypatch) -> None:
+    record = current_equivalencies(parse_export(SAMPLE_EXPORT))[-1]
+    calls = []
+
+    def handler(request):
+        calls.append(str(request.url))
+        return httpx.Response(200, text="MAT132 <strong>Minimum Grade:</strong> C<br/>")
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        client = NJTransferClient(cache_dir=tmp_path, http_client=http)
+        monkeypatch.setattr(client, "_start_session", lambda: "123")
+        client.get_equivalency_details(record)
+        client.get_equivalency_details(replace(record, middlesex_effective_term="202109"))
+    assert len(calls) == 2
+    assert calls[0] != calls[1]
+
+
+def test_transfer_export_refresh_invalidates_details(tmp_path: Path, monkeypatch) -> None:
+    record = current_equivalencies(parse_export(SAMPLE_EXPORT))[-1]
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(200, text="MAT132 <strong>Minimum Grade:</strong> C<br/>")
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        client = NJTransferClient(cache_dir=tmp_path, http_client=http)
+        monkeypatch.setattr(client, "_start_session", lambda: "123")
+        monkeypatch.setattr(
+            client, "_download_export", lambda: (SAMPLE_EXPORT, "https://www.njtransfer.org/export")
+        )
+        client.get_equivalency_details(record)
+        client.get_equivalencies()
+        client.get_equivalency_details(record)
+    assert len(calls) == 2
