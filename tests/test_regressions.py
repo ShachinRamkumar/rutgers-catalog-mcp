@@ -1000,3 +1000,50 @@ def test_unlocked_clients_do_not_write_and_return_upstream_on_miss(
     assert len(records) == 5
     assert nj_info.source == "network"
     assert not (nj_dir / "middlesex-rutgers-soe-active.txt").exists()
+
+
+@pytest.mark.parametrize("mode", ["200", "304_match", "304_retry"])
+def test_unlocked_soc_does_not_unlink_existing_bundle_on_no_store(
+    tmp_path: Path, mode: str
+) -> None:
+    soc_dir = tmp_path / f"soc-{mode}"
+    soc_dir.mkdir()
+    (soc_dir / ".courses-2026-9-NB.lock").mkdir()
+    cache_file = soc_dir / "courses-2026-9-NB.cache.json"
+    cache_file.write_text(
+        json.dumps(
+            {
+                "meta": {"etag": '"v1"', "max_age": 60, "fetched_at": "2026-08-01"},
+                "payload": [{"courseString": "14:332:331"}],
+            }
+        )
+    )
+    os.utime(cache_file, (1, 1))
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if mode == "200":
+            return httpx.Response(
+                200,
+                json=[{"courseString": "14:332:452"}],
+                headers={"Cache-Control": "no-store"},
+            )
+        if mode == "304_match":
+            return httpx.Response(304, headers={"ETag": '"v1"', "Cache-Control": "no-store"})
+        if calls == 1:
+            return httpx.Response(304, headers={"ETag": '"v2"'})
+        return httpx.Response(304, headers={"Cache-Control": "no-store"})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        client = SocClient(cache_dir=soc_dir, http_client=http)
+        if mode == "304_retry":
+            with pytest.raises(SocApiError, match="unconditional GET"):
+                client.get_courses(Term(2026, "fall"), "NB")
+        else:
+            courses, info = client.get_courses(Term(2026, "fall"), "NB")
+            assert info.source == ("network" if mode == "200" else "validated_cache")
+            assert courses[0]["courseString"] == ("14:332:452" if mode == "200" else "14:332:331")
+    # Without the lock, existing on-disk bundle must remain untouched.
+    assert cache_file.exists()

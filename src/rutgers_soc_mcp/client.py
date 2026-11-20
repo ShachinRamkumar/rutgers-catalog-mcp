@@ -359,7 +359,9 @@ class SocClient:
         # Never trust a legacy separately-written ETag; keep payload for fresh/offline continuity.
         return payload, legacy_meta, legacy_data
 
-    def _evict_cache(self, stem: str) -> None:
+    def _evict_cache(self, stem: str, *, locked: bool) -> None:
+        if not locked:
+            return
         for suffix in (".cache.json", ".json", ".meta.json"):
             with contextlib.suppress(OSError):
                 (self.cache_dir / f"{stem}{suffix}").unlink(missing_ok=True)
@@ -429,18 +431,18 @@ class SocClient:
                     cache_control = response.headers.get("cache-control")
                     if not (cached is not None and cached_etag):
                         if _has_no_store(cache_control):
-                            self._evict_cache(stem)
+                            self._evict_cache(stem, locked=locked)
                             cached = None
                         raise SocApiError("Rutgers SOC returned an unsolicited 304 response")
                     response_etag = response.headers.get("etag")
                     if response_etag and response_etag != cached_etag:
                         # RFC 9111 section 4.3.4: validator mismatch; honor no-store before retry.
                         if _has_no_store(cache_control):
-                            self._evict_cache(stem)
+                            self._evict_cache(stem, locked=locked)
                             cached = None
                         response = self.http.get(url, params=params)
                         if _has_no_store(response.headers.get("cache-control")):
-                            self._evict_cache(stem)
+                            self._evict_cache(stem, locked=locked)
                             cached = None
                         if response.status_code == 304:
                             raise _SocProtocolError(
@@ -449,7 +451,7 @@ class SocClient:
                     else:
                         now = datetime.now(tz=UTC)
                         if _has_no_store(cache_control):
-                            self._evict_cache(stem)
+                            self._evict_cache(stem, locked=locked)
                         elif locked:
                             updated_meta = {
                                 **meta,
@@ -463,7 +465,7 @@ class SocClient:
                         )
                 cache_control = response.headers.get("cache-control")
                 if _has_no_store(cache_control):
-                    self._evict_cache(stem)
+                    self._evict_cache(stem, locked=locked)
                     cached = None
                 response.raise_for_status()
                 payload = response.json()
