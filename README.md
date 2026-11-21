@@ -10,22 +10,11 @@ Every server runs locally over `stdio`, requires no account or credentials, and 
 
 ## Architecture
 
-```mermaid
-flowchart LR
-    Client["MCP Client (stdio)"]
-
-    Client -->|stdio| SoC["rutgers-soc-mcp<br/>SoC_Get_Course<br/>SoC_Search_Courses"]
-    Client -->|stdio| MCC["middlesex-courses-mcp<br/>Middlesex_Search_Options<br/>Middlesex_Search_Classes<br/>Middlesex_Class_Details"]
-    Client -->|stdio| NJT["nj-transfer-mcp<br/>NJTransfer_Find_Middlesex_Equivalents<br/>NJTransfer_Middlesex_Course<br/>NJTransfer_Search"]
-
-    SoC <--> SoCCache[("Disk Cache<br/>ETag + max-age<br/>stale fallback")]
-    SoC -->|HTTPS GET| SoCAPI["classes.rutgers.edu/soc/api<br/>courses.json + openSections.json"]
-
-    MCC -->|HTTPS GET/POST<br/>guest session| MCCAPI["Middlesex Ellucian<br/>Guest Course Catalog"]
-
-    NJT <--> NJTCache[("Disk + Memory Cache<br/>24h export / 15m details")]
-    NJT -->|HTTPS GET/POST| NJTAPI["njtransfer.org<br/>Equivalency Export + Details"]
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/architecture-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="docs/architecture-light.svg">
+  <img alt="Rutgers Catalog MCP architecture diagram showing an MCP client connecting over stdio to rutgers-soc-mcp, middlesex-courses-mcp, and nj-transfer-mcp, along with their caches and upstream public endpoints." src="docs/architecture-light.svg" width="100%">
+</picture>
 
 ## Servers & Tools
 
@@ -63,7 +52,7 @@ Cache directories default to the platform user cache location (`platformdirs`) a
 
 ### Local setup with `uv`
 
-Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then clone (authenticated access is required while the repository is private) and sync:
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then clone the repository and sync:
 
 ```bash
 gh repo clone ShachinRamkumar/rutgers-catalog-mcp
